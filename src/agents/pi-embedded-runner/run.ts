@@ -444,18 +444,26 @@ export async function runEmbeddedPiAgent(
     // 创建新对象，不修改原始参数（无副作用）
     params = { ...params, sessionKey: effectiveSessionKey };
   }
+  // 用户隔离队列,每个用户一个独立队列，防止任务互相干扰.根据 sessionKey / sessionId 生成
   const sessionLane = resolveSessionLane(params.sessionKey?.trim() || params.sessionId);
+  // 公共全局队列,所有用户共享的通道
   const globalLane = resolveGlobalLane(params.lane);
+  // 计算任务超时, 自动 +30 秒宽限期
   const laneTaskTimeoutMs = resolveEmbeddedRunLaneTimeoutMs(params.timeoutMs);
+  // 给任务自动加上超时
   const withLaneTimeout = (opts?: CommandQueueEnqueueOptions) =>
     withEmbeddedRunLaneTimeout(opts, laneTaskTimeoutMs);
+  // 全局任务执行,任务进入公共队列,自动带超时
   const enqueueGlobal = <T>(task: () => Promise<T>, opts?: CommandQueueEnqueueOptions) =>
     params.enqueue
       ? params.enqueue(task, withLaneTimeout(opts))
       : enqueueCommandInLane(globalLane, task, withLaneTimeout(opts));
+  // 会话任务执行, 任务进入用户独立队列, 确保用户之间完全隔离
   const enqueueSession = <T>(task: () => Promise<T>, opts?: CommandQueueEnqueueOptions) =>
     params.enqueue ? params.enqueue(task, opts) : enqueueCommandInLane(sessionLane, task, opts);
+  // 消息渠道（如：短信、钉钉、飞书、Web、微信等）
   const channelHint = params.messageChannel ?? params.messageProvider;
+  // 自动判断返回格式：支持 Markdown → markdown,不支持（如短信）→ plain 纯文本. 默认 markdown
   const resolvedToolResultFormat =
     params.toolResultFormat ??
     (channelHint
@@ -463,87 +471,136 @@ export async function runEmbeddedPiAgent(
         ? "markdown"
         : "plain"
       : "markdown");
+  // 是否是测试探测会话, sessionId 以 probe- 开头就是测试
   const isProbeSession = params.sessionId?.startsWith("probe-") ?? false;
 
+  // 检查任务是否被取消，如果已取消，立即抛出 AbortError 中断执行
   const throwIfAborted = () => {
+    // 1. 如果没有取消信号 或 任务未取消 → 直接返回，继续执行
     if (!params.abortSignal?.aborted) {
       return;
     }
-    const reason = params.abortSignal.reason;
+    // 2. 代码走到这里 = 任务已经被取消（aborted）
+    const reason = params.abortSignal.reason;  // 获取取消原因
+    
+    // 3. 如果原因本身就是 Error 对象 → 直接抛出
     if (reason instanceof Error) {
       throw reason;
     }
+    // 4. 否则 → 创建标准的 AbortError 对象
     const abortErr =
       reason !== undefined
-        ? new Error("Operation aborted", { cause: reason })
-        : new Error("Operation aborted");
+        ? new Error("Operation aborted", { cause: reason })  // 带原因
+        : new Error("Operation aborted");   // 不带原因
+    
+    // 标准错误名称，方便上层识别是“取消”而非普通报错
     abortErr.name = "AbortError";
+    // 5. 抛出错误，终止任务
     throw abortErr;
   };
 
   throwIfAborted();
 
+  // 最外层：把整个任务丢进【用户会话隔离队列】执行
   return enqueueSession(() => {
+    // 立刻检查：任务是否已被取消（用户取消/超时）
     throwIfAborted();
+    
+    // 内层：再把核心执行逻辑丢进【全局公共队列】
     return enqueueGlobal(async () => {
+      // 再次检查取消（双重保险）
       throwIfAborted();
+      // 记录任务开始时间（用于统计耗时）
       const started = Date.now();
+      // 创建任务启动阶段追踪器（跟踪：初始化/加载模型/调用工具等阶段）
       const startupStages = createEmbeddedRunStageTracker();
+      // 标记：启动阶段事件是否已发送
       let startupStagesEmitted = false;
+      
+      // 定义一个【执行阶段通知工具函数】
+      // 作用：向外发送当前AI任务跑到哪个阶段了（如：思考中、调用工具、生成答案）
       const notifyExecutionPhase = (
-        phase: Parameters<NonNullable<RunEmbeddedPiAgentParams["onExecutionPhase"]>>[0]["phase"],
-        extra?: Omit<
+        phase: Parameters<NonNullable<RunEmbeddedPiAgentParams["onExecutionPhase"]>>[0]["phase"],  //阶段类型
+        extra?: Omit<   // 额外信息
           Parameters<NonNullable<RunEmbeddedPiAgentParams["onExecutionPhase"]>>[0],
           "phase"
         >,
       ) => {
+        // 如果外部传入了回调函数，就调用它，通知外部当前阶段
         params.onExecutionPhase?.({ phase, ...extra });
       };
+      
+      // 输出【启动阶段耗时总结日志】
+      // phase：当前处于哪个阶段（如：started / model_called / completed）
       const emitStartupStageSummary = (phase: string) => {
+        // 1. 获取阶段追踪器的快照（所有阶段的耗时、步骤）
         const summary = startupStages.snapshot();
+        // 2. 判断是否需要警告（某些阶段过慢 → 警告日志）
         const shouldWarn = shouldWarnEmbeddedRunStageSummary(summary);
+        // 3. 优化：不需要警告 + 没开 trace 日志 → 直接跳过，不打印
         if (!shouldWarn && !log.isEnabled("trace")) {
           return;
         }
+
+        // 4. 格式化日志消息（包含 runId、sessionId、阶段、耗时详情）
         const message = formatEmbeddedRunStageSummary(
           `[trace:embedded-run] startup stages: runId=${params.runId} sessionId=${params.sessionId} phase=${phase}`,
           summary,
         );
+
+        // 5. 根据是否需要警告，决定用 warn 还是 trace 级别打印
         if (shouldWarn) {
-          log.warn(message);
+          log.warn(message);  // 慢/异常 → 警告级别
         } else {
-          log.trace(message);
+          log.trace(message);   // 正常 → 调试/追踪级别
         }
       };
+      
+      // 1. 触发外部回调：告诉上层“任务正式开始执行了”
       params.onExecutionStarted?.();
+      // 2. 通知执行阶段：当前进入【运行器已启动】阶段
       notifyExecutionPhase("runner_entered");
+      // 3. 解析本次运行的工作目录（存放临时文件、缓存、工具生成的文件）
       const workspaceResolution = resolveRunWorkspaceDir({
         workspaceDir: params.workspaceDir,
         sessionKey: params.sessionKey,
         agentId: params.agentId,
         config: params.config,
       });
+      
+      // 4. 最终确定的工作目录路径
       const resolvedWorkspace = workspaceResolution.workspaceDir;
+      // 5. 解析“标准/官方”工作目录（系统默认给这个代理分配的目录）
       const canonicalWorkspace = resolveUserPath(
         resolveAgentWorkspaceDir(params.config ?? {}, workspaceResolution.agentId),
       );
+      // 6. 判断：当前目录 是否等于 系统标准目录
       const isCanonicalWorkspace = canonicalWorkspace === resolvedWorkspace;
+      // 7. 安全脱敏：给 sessionId 打码（日志不泄露真实ID）
       const redactedSessionId = redactRunIdentifier(params.sessionId);
+      // 8. 安全脱敏：给 sessionKey 打码
       const redactedSessionKey = redactRunIdentifier(params.sessionKey);
+      // 9. 安全脱敏：给工作目录路径打码
       const redactedWorkspace = redactRunIdentifier(resolvedWorkspace);
+      // 10. 如果工作目录使用了【降级/兜底 fallback】路径 → 打印警告日志
       if (workspaceResolution.usedFallback) {
         log.warn(
           `[workspace-fallback] caller=runEmbeddedPiAgent reason=${workspaceResolution.fallbackReason} run=${params.runId} session=${redactedSessionId} sessionKey=${redactedSessionKey} agent=${workspaceResolution.agentId} workspace=${redactedWorkspace}`,
         );
       }
+      // 11. 标记阶段：工作目录准备完成（耗时追踪）
       startupStages.mark("workspace");
+      // 12. 通知外部：当前进入 workspace 准备完成阶段
       notifyExecutionPhase("workspace");
+      // 13. 确保运行时插件全部加载完成（核心功能扩展）
       ensureRuntimePluginsLoaded({
         config: params.config,
         workspaceDir: resolvedWorkspace,
         allowGatewaySubagentBinding: params.allowGatewaySubagentBinding,
       });
+      // 14. 标记阶段：运行时插件加载完成
       startupStages.mark("runtime-plugins");
+      // 15. 通知外部：进入插件加载完成阶段
       notifyExecutionPhase("runtime_plugins");
 
       let provider = (params.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
