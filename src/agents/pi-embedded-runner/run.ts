@@ -179,16 +179,19 @@ import type {
 } from "./types.js";
 import { createUsageAccumulator, mergeUsageIntoAccumulator } from "./usage-accumulator.js";
 
-type ApiKeyInfo = ResolvedProviderAuth;
+type ApiKeyInfo = ResolvedProviderAuth;  //已经处理好的AI服务商认证信息
 
-const MAX_SAME_MODEL_IDLE_TIMEOUT_RETRIES = 1;
-const EMBEDDED_RUN_LANE_TIMEOUT_GRACE_MS = 30_000;
+const MAX_SAME_MODEL_IDLE_TIMEOUT_RETRIES = 1;  //AI 模型调用超时 / 空闲断开时，最多自动重试 1 次
+const EMBEDDED_RUN_LANE_TIMEOUT_GRACE_MS = 30_000;  //AI 对话在后台嵌入式执行时，给 30 秒缓冲时间，避免立即判定超时
 const MID_TURN_PRECHECK_CONTINUATION_PROMPT =
   "Continue from the current transcript after the latest tool result. Do not repeat the original user request, and do not rerun completed tools unless the transcript shows they are still needed.";
 const COMPACTION_CONTINUATION_RETRY_INSTRUCTION =
   "The previous attempt compacted the conversation context before producing a final user-visible answer. Continue from the compacted transcript and produce the final answer now. Do not restart from scratch, do not repeat completed work, and do not rerun tools unless the transcript clearly lacks required evidence.";
+
+//给 AI 运行结果定义一个类型名称，让后续代码能安全使用这个结果的字段。
 type EmbeddedRunAttemptForRunner = Awaited<ReturnType<typeof runEmbeddedAttemptWithBackend>>;
 
+//根据传入的 provider 和 harnessId，返回最终要使用的 provider 字符串
 function resolveHarnessContextConfigProvider(params: {
   provider: string;
   harnessId: string;
@@ -199,6 +202,8 @@ function resolveHarnessContextConfigProvider(params: {
   return params.provider;
 }
 
+//计算嵌入式运行通道的**最终超时时间**
+//给原始超时时间增加 30 秒宽限期，并做合法性校验；无效时间直接返回 undefined。
 function resolveEmbeddedRunLaneTimeoutMs(timeoutMs: number): number | undefined {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     return undefined;
@@ -206,6 +211,8 @@ function resolveEmbeddedRunLaneTimeoutMs(timeoutMs: number): number | undefined 
   return Math.floor(timeoutMs) + EMBEDDED_RUN_LANE_TIMEOUT_GRACE_MS;
 }
 
+//给队列任务设置“嵌入式运行通道超时时间”
+//只有【有超时 + 原配置没超时】 → 才把超时设置进去
 function withEmbeddedRunLaneTimeout(
   opts: CommandQueueEnqueueOptions | undefined,
   laneTaskTimeoutMs: number | undefined,
@@ -216,9 +223,14 @@ function withEmbeddedRunLaneTimeout(
   return { ...opts, taskTimeoutMs: laneTaskTimeoutMs };
 }
 
+//把 AI 嵌入式运行的结果“标准化”
+//确保所有数组/对象字段一定存在，不会是 null / undefined，防止代码报错
 function normalizeEmbeddedRunAttemptResult(
   attempt: EmbeddedRunAttemptForRunner,
 ): EmbeddedRunAttemptForRunner {
+  
+  // 第一步：把原始数据转成“允许字段为 null”的类型
+  // 因为后端/数据库可能返回 null，但前端/业务期望永远是数组/对象
   const raw = attempt as EmbeddedRunAttemptForRunner & {
     assistantTexts?: EmbeddedRunAttemptForRunner["assistantTexts"] | null;
     toolMetas?: EmbeddedRunAttemptForRunner["toolMetas"] | null;
@@ -228,33 +240,47 @@ function normalizeEmbeddedRunAttemptResult(
     messagingToolSentTargets?: EmbeddedRunAttemptForRunner["messagingToolSentTargets"] | null;
     itemLifecycle?: EmbeddedRunAttemptForRunner["itemLifecycle"] | null;
   };
+  
+  // 第二步：返回一个**全新的、安全的对象**
   return {
-    ...attempt,
+    ...attempt,  // 保留所有原有字段
+
+    // 核心：空值安全替换（null / undefined → 替换成默认值）
     assistantTexts: raw.assistantTexts ?? [],
     toolMetas: raw.toolMetas ?? [],
     messagesSnapshot: raw.messagesSnapshot ?? [],
     messagingToolSentTexts: raw.messagingToolSentTexts ?? [],
     messagingToolSentMediaUrls: raw.messagingToolSentMediaUrls ?? [],
     messagingToolSentTargets: raw.messagingToolSentTargets ?? [],
+    
+    // 对象类型：空 → 给默认结构（全0）
     itemLifecycle: raw.itemLifecycle ?? {
       startedCount: 0,
       completedCount: 0,
       activeCount: 0,
     },
+    // 额外处理：解析重试/回放元数据
     replayMetadata: resolveAttemptReplayMetadata(raw),
   };
 }
 
+//判断 AI 运行任务是否已经产生了 “有效进度”，用于防止任务无限空转 / 超时中断（idle breaker）
 function hasCompletedModelProgressForIdleBreaker(attempt: EmbeddedRunAttemptForRunner): boolean {
   return (
+    // 1. 有非空的助手回复文本
     attempt.assistantTexts.some((text) => text.trim().length > 0) ||
+    // 2. 调用过工具
     attempt.toolMetas.length > 0 ||
+    // 3. 有客户端工具调用
     (attempt.clientToolCalls?.length ?? 0) > 0 ||
+    // 4. 有消息工具发送证据（发过消息/文件）
     hasMessagingToolDeliveryEvidence(attempt) ||
+    // 5. 有任务完成计数
     attempt.itemLifecycle.completedCount > 0
   );
 }
 
+//创建一个空的、初始状态的认证配置存储器，用于存储用户的 API Key、认证信息等。
 function createEmptyAuthProfileStore(): AuthProfileStore {
   return {
     version: 1,
@@ -262,49 +288,72 @@ function createEmptyAuthProfileStore(): AuthProfileStore {
   };
 }
 
+/**
+ * 从完整的认证配置仓库中，筛选出指定 profileIds 的配置
+ * 创建一个【作用域限定】的、仅包含指定凭证的新配置仓库
+ */
 function createScopedAuthProfileStore(
-  store: AuthProfileStore,
-  profileIds: string | undefined | string[],
-): AuthProfileStore {
+  store: AuthProfileStore,  // 完整的认证配置仓库（所有密钥/配置）
+  profileIds: string | undefined | string[],  // 要保留的配置ID（单个/数组/空）
+): AuthProfileStore {            // 返回：筛选后的新配置仓库
+  
+  // 1. 安全获取所有凭证，空值兜底为 {}
   const profiles = store.profiles ?? {};
+  // 2. 把传入的 profileIds 统一格式化为【干净的字符串数组】
   const normalizedProfileIds = (Array.isArray(profileIds) ? profileIds : [profileIds])
     .map((profileId) => profileId?.trim())
     .filter((profileId): profileId is string => !!profileId);
+  // 3. 从完整配置中，只挑出【存在且有效】的指定ID凭证
   const scopedProfiles = Object.fromEntries(
     normalizedProfileIds.flatMap((profileId) => {
-      const credential = profiles[profileId];
-      return credential ? [[profileId, credential] as const] : [];
+      const credential = profiles[profileId];  // 查找对应ID的凭证
+      return credential ? [[profileId, credential] as const] : [];  // 有就保留，没有就丢弃
     }),
   );
+  
+  // 4. 最终返回：有筛选结果 → 返回；无结果 → 返回空初始配置
   return Object.keys(scopedProfiles).length > 0
     ? {
-        version: store.version,
-        profiles: scopedProfiles,
+        version: store.version,   // 保留原版本号
+        profiles: scopedProfiles,  // 只保留筛选后的凭证
       }
-    : createEmptyAuthProfileStore();
+    : createEmptyAuthProfileStore();   // 空 → 创建空认证仓库
 }
 
+/**
+ * 构建工具调用追踪摘要
+ * 作用：从工具元数据中，统计调用次数、不重复的工具列表、是否失败
+ */
 function buildTraceToolSummary(params: {
-  toolMetas?: Array<{ toolName: string; meta?: string }>;
-  hadFailure: boolean;
-}): ToolSummaryTrace | undefined {
+  toolMetas?: Array<{ toolName: string; meta?: string }>;  // 工具调用记录
+  hadFailure: boolean;   // 是否有失败
+}): ToolSummaryTrace | undefined {   // 返回摘要 或 undefined（无工具时）
+  
+  // 1. 如果没有工具调用记录 → 直接返回 undefined，不生成摘要
   if (!params.toolMetas?.length) {
     return undefined;
   }
+  // 2. 初始化：工具名称数组 + 去重 Set
   const tools: string[] = [];
   const seen = new Set<string>();
+
+  // 3. 遍历所有工具调用，**去重**收集工具名称
   for (const entry of params.toolMetas) {
+    // 标准化工具名（空值处理、trim 等）
     const toolName = normalizeOptionalString(entry.toolName);
+    // 如果工具名不存在，或已经记录过 → 跳过
     if (!toolName || seen.has(toolName)) {
       continue;
     }
+    // 否则 → 加入去重集合和结果列表
     seen.add(toolName);
     tools.push(toolName);
   }
+  // 4. 返回最终的工具调用摘要
   return {
-    calls: params.toolMetas?.length ?? 0,
-    tools,
-    failures: params.hadFailure ? 1 : 0,
+    calls: params.toolMetas?.length ?? 0,  // 总调用次数
+    tools,   // 不重复的工具名称列表
+    failures: params.hadFailure ? 1 : 0,   // 失败标记（0=无，1=有）
   };
 }
 
@@ -315,32 +364,40 @@ function buildTraceToolSummary(params: {
  * with no side effects.
  * See: https://github.com/openclaw/openclaw/issues/60552
  */
+// 会话密钥自动回填函数，属于 AI 代理会话管理的核心工具。
+// 输入sessionId，自动找到/补全sessionKey
 function backfillSessionKey(params: {
-  config: RunEmbeddedPiAgentParams["config"];
-  sessionId: string;
-  sessionKey?: string;
-  agentId?: string;
-}): string | undefined {
+  config: RunEmbeddedPiAgentParams["config"];  // 系统配置
+  sessionId: string;     // 会话 ID（必须）
+  sessionKey?: string;   // 会话密钥（可选，要回填的就是它）
+  agentId?: string;      // 代理 ID（可选）
+}): string | undefined {   // 返回：sessionKey 或 undefined
+  // 1. 先把传入的 sessionKey 标准化（去空格、空值转 undefined）
   const trimmed = normalizeOptionalString(params.sessionKey);
+  // 2. 如果用户已经提供了有效的 sessionKey → 直接返回，不做任何事
   if (trimmed) {
     return trimmed;
   }
+  // 3. 如果没有 config 或没有 sessionId → 无法回填，返回 undefined
   if (!params.config || !params.sessionId) {
     return undefined;
   }
   try {
+    // 4. 根据是否有 agentId，调用不同的方法去【通过 sessionId 查找 sessionKey】
     const resolved = normalizeOptionalString(params.agentId)
-      ? resolveStoredSessionKeyForSessionId({
+      ? resolveStoredSessionKeyForSessionId({  // 有 agentId → 走存储查询
           cfg: params.config,
           sessionId: params.sessionId,
           agentId: params.agentId,
         })
-      : resolveSessionKeyForRequest({
+      : resolveSessionKeyForRequest({     // 无 agentId → 走请求查询
           cfg: params.config,
           sessionId: params.sessionId,
         });
+    // 5. 返回查询到的 sessionKey（再次标准化）
     return normalizeOptionalString(resolved.sessionKey);
   } catch (err) {
+    // 6. 异常处理：查询失败 → 打警告日志，返回 undefined
     log.warn(
       `[backfillSessionKey] Failed to resolve sessionKey for sessionId=${redactRunIdentifier(sanitizeForLog(params.sessionId))}: ${formatErrorMessage(err)}`,
     );
@@ -348,17 +405,20 @@ function backfillSessionKey(params: {
   }
 }
 
+// AI 回复内容标准化函数
+// 把传入的回复统一包装成固定格式的数组，确保程序永远不会报错。
 function buildHandledReplyPayloads(reply?: ReplyPayload) {
+  // 1. 标准化：如果 reply 是 null/undefined → 自动替换为【静默回复】
   const normalized = reply ?? { text: SILENT_REPLY_TOKEN };
   return [
     {
-      text: normalized.text,
-      mediaUrl: normalized.mediaUrl,
-      mediaUrls: normalized.mediaUrls,
-      replyToId: normalized.replyToId,
-      audioAsVoice: normalized.audioAsVoice,
-      isError: normalized.isError,
-      isReasoning: normalized.isReasoning,
+      text: normalized.text,            // 回复文本
+      mediaUrl: normalized.mediaUrl,    // 单个媒体地址
+      mediaUrls: normalized.mediaUrls,  // 多个媒体地址
+      replyToId: normalized.replyToId,  // 回复目标ID
+      audioAsVoice: normalized.audioAsVoice,  // 音频是否作为语音
+      isError: normalized.isError,       // 是否是错误消息
+      isReasoning: normalized.isReasoning,  // 是否是思考过程
     },
   ];
 }
@@ -3107,10 +3167,11 @@ export async function runEmbeddedPiAgent(
   });
 }
 
+//按优先级安全获取 AI 服务商名称：配置里的 provider → profileId 冒号前的前缀 → 默认值，永远返回有效字符串。
 function resolveAuthProfileStateProvider(
-  store: AuthProfileStore,
-  profileId: string,
-  fallbackProvider: string,
+  store: AuthProfileStore,    // 认证配置仓库（存所有 API Key）
+  profileId: string,          // 当前要查询的配置 ID
+  fallbackProvider: string,   
 ): string {
   const profileProvider = store.profiles?.[profileId]?.provider?.trim();
   if (profileProvider) {
