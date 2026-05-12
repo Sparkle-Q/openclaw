@@ -423,18 +423,25 @@ function buildHandledReplyPayloads(reply?: ReplyPayload) {
   ];
 }
 
+// 异步函数：运行嵌入式 Pi 智能代理
 export async function runEmbeddedPiAgent(
-  params: RunEmbeddedPiAgentParams,
-): Promise<EmbeddedPiRunResult> {
+  params: RunEmbeddedPiAgentParams,   // 入参：所有运行需要的配置、会话、代理信息
+): Promise<EmbeddedPiRunResult> {    // 返回值：异步返回运行结果
   // Resolve sessionKey early so all downstream consumers (hooks, LCM, compaction)
   // receive a non-null key even when callers omit it. See #60552.
+  // 提前解析 sessionKey，确保下游所有模块（钩子、会话管理、上下文压缩）都能拿到合法的Key
+  // 即使调用方没传，也能拿到非空的 key。对应 GitHub Issue #60552
   const effectiveSessionKey = backfillSessionKey({
     config: params.config,
     sessionId: params.sessionId,
     sessionKey: params.sessionKey,
     agentId: params.agentId,
   });
+
+  // 如果解析后的 key 和原来传入的不一样（说明自动回填/修正了）
   if (effectiveSessionKey !== params.sessionKey) {
+    // 用新的 sessionKey 替换原来的参数
+    // 创建新对象，不修改原始参数（无副作用）
     params = { ...params, sessionKey: effectiveSessionKey };
   }
   const sessionLane = resolveSessionLane(params.sessionKey?.trim() || params.sessionId);
