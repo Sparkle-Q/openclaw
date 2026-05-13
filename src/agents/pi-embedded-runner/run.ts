@@ -960,26 +960,37 @@ export async function runEmbeddedPiAgent(
           : providerOrderedProfiles.length > 0
             ? providerOrderedProfiles
             : [undefined];
+      // 插件模式下，筛选出【允许转发给插件】的认证列表
       const pluginHarnessForwardedProfileCandidates = pluginHarnessOwnsTransport
         ? profileCandidates.filter(isForwardablePluginHarnessAuthProfile)
         : [];
+      // 决定用哪个存储来记录认证失败（插件/普通模式分开）
       const profileFailureStore = pluginHarnessOwnsTransport ? attemptAuthProfileStore : authStore;
+      // 当前正在尝试第几个认证（从第0个开始）
       let profileIndex = 0;
+      // 日志：记录所有认证尝试过程（方便排查问题）
       const traceAttempts: TraceAttempt[] = [];
 
+      // 初始思考模式：默认关闭（off）
       const initialThinkLevel = params.thinkLevel ?? "off";
+      // 当前实际使用的思考模式（可能会动态变化）
       let thinkLevel = initialThinkLevel;
+      // 记录已经尝试过哪些思考模式（避免重复试）
       const attemptedThinking = new Set<ThinkLevel>();
+      // 当前使用的 API Key 信息（密钥、权限、所属用户）
       let apiKeyInfo: ApiKeyInfo | null = null;
+      // 上一次使用的认证 profile ID
       let lastProfileId: string | undefined;
+      // 运行时认证状态（是否登录、是否过期、是否需要刷新）
       let runtimeAuthState: RuntimeAuthState | null = null;
+      // 标记：是否取消了认证刷新流程
       let runtimeAuthRefreshCancelled = false;
       const {
-        advanceAuthProfile,
-        initializeAuthProfile,
-        maybeRefreshRuntimeAuthForAuthError,
-        stopRuntimeAuthRefreshTimer,
-      } = createEmbeddedRunAuthController({
+        advanceAuthProfile,   // 自动换下一个密钥（密钥坏了/限流了）
+        initializeAuthProfile,   // 初始化当前选中的密钥
+        maybeRefreshRuntimeAuthForAuthError,  // 密钥过期自动刷新
+        stopRuntimeAuthRefreshTimer,    // 停止刷新定时器
+      } = createEmbeddedRunAuthController({  // 认证控制器，所有和密钥、权限、重试相关的逻辑全部交给它管
         config: params.config,
         agentDir,
         workspaceDir: resolvedWorkspace,
@@ -1026,11 +1037,16 @@ export async function runEmbeddedPiAgent(
         },
         log,
       });
+      // 插件模式专用的 “自动换密钥” 函数
+      // 当前密钥坏了 / 限流了 → 自动找到下一个可用、安全、没被冷却的密钥，切换过去。
       const advancePluginHarnessAuthProfile = async (): Promise<boolean> => {
+        // 1. 不是插件模式 或 密钥被用户锁定 → 不能自动切换，直接 return false
         if (!pluginHarnessOwnsTransport || lockedProfileId) {
           return false;
         }
+        // 2. 从【下一个索引】开始找可用密钥
         let nextIndex = profileIndex + 1;
+        // 3. 遍历所有候选密钥，找一个能用的
         while (nextIndex < profileCandidates.length) {
           const candidate = profileCandidates[nextIndex];
           if (!candidate || !isForwardablePluginHarnessAuthProfile(candidate)) {
