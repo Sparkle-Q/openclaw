@@ -605,16 +605,20 @@ export async function runEmbeddedPiAgent(
 
       let provider = (params.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
       let modelId = (params.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
+      // agent的本地配置目录，存放：模型配置、工具、插件、脚本
       const agentDir =
         params.agentDir ?? resolveAgentDir(params.config ?? {}, workspaceResolution.agentId);
       const normalizedSessionKey = params.sessionKey?.trim();
+      // 判断是否配置了模型自动降级
       const fallbackConfigured = hasConfiguredModelFallbacks({
         cfg: params.config,
         agentId: params.agentId,
         sessionKey: normalizedSessionKey,
       });
       const resolvedSessionKey = normalizedSessionKey;
+      // 全局钩子执行器，负责运行beforeRun/afterRun/...等生命周期函数
       const hookRunner = getGlobalHookRunner();
+      // 钩子上下文 = 任务的“身份证+全部信息”
       const hookCtx = {
         runId: params.runId,
         jobId: params.jobId,
@@ -627,40 +631,54 @@ export async function runEmbeddedPiAgent(
         trigger: params.trigger,
         ...buildAgentHookContextChannelFields(params),
       };
-      if (params.trigger === "cron" && hookRunner?.hasHooks("before_agent_reply")) {
+      
+      // 定时任务（cron）专属钩子逻辑，
+      // 作用是：在定时任务触发时，提前运行回复钩子，如果钩子直接处理了请求，就直接返回结果，不再走完整 AI 流程。
+      if (params.trigger === "cron" && hookRunner?.hasHooks("before_agent_reply")) {  // 1. 判断：只有【定时任务 cron 触发】 + 【注册了 before_agent_reply 钩子】才执行
+        // 2. 执行【回复前钩子】，传入用户提示词 + 上下文
         const hookResult = await hookRunner.runBeforeAgentReply(
-          { cleanedBody: params.prompt },
-          hookCtx,
+          { cleanedBody: params.prompt },  // 输入：用户的提示词
+          hookCtx,       // 上下文：任务全部信息
         );
+        // 3. 如果钩子返回 handled = true → 表示【已由钩子直接处理，不用AI了】
         if (hookResult?.handled) {
+          // 4. 直接构造返回结果，提前结束任务
           return {
+            // 标准化回复 payload
             payloads: buildHandledReplyPayloads(hookResult.reply),
+            // 元信息（耗时、模型、会话等）
             meta: {
-              durationMs: Date.now() - started,
+              durationMs: Date.now() - started,              // 总耗时
               agentMeta: {
-                sessionId: params.sessionId,
-                provider,
-                model: modelId,
+                sessionId: params.sessionId,                 // 会话ID
+                provider,                                    // 服务商
+                model: modelId,                              // 模型
               },
+              // 最终回复文本
               finalAssistantVisibleText: hookResult.reply?.text ?? SILENT_REPLY_TOKEN,
               finalAssistantRawText: hookResult.reply?.text ?? SILENT_REPLY_TOKEN,
             },
           };
         }
       }
-
+      // 通过钩子动态修改最终要使用的 AI 服务商和模型 
       const hookSelection = await resolveHookModelSelection({
-        prompt: params.prompt,
-        attachments: buildBeforeModelResolveAttachments(params.images),
-        provider,
-        modelId,
-        hookRunner,
-        hookContext: hookCtx,
+        prompt: params.prompt,              // 用户输入的提示词
+        attachments: buildBeforeModelResolveAttachments(params.images),   // 图片/附件
+        provider,     // 当前默认的服务商
+        modelId,      // 当前默认的模型ID
+        hookRunner,   // 钩子运行器
+        hookContext: hookCtx,   // 钩子上下文（任务全部信息）
       });
+      // 用【钩子返回的结果】覆盖原来的服务商
       provider = hookSelection.provider;
+      // 用【钩子返回的结果】覆盖原来的模型ID
       modelId = hookSelection.modelId;
+      // 兼容旧版钩子的返回结果（历史遗留兼容）
       const legacyBeforeAgentStartResult = hookSelection.legacyBeforeAgentStartResult;
+      // 性能打点：标记钩子执行完成
       startupStages.mark("hooks");
+      // 确保【当前选中的模型/服务商】对应的插件已经加载完毕
       await ensureSelectedAgentHarnessPlugin({
         provider,
         modelId,
@@ -669,6 +687,7 @@ export async function runEmbeddedPiAgent(
         sessionKey: params.sessionKey,
         workspaceDir: resolvedWorkspace,
       });
+      // 根据模型、服务商、配置 → 选中【真正负责执行AI的执行器】
       const agentHarness = selectAgentHarness({
         provider,
         modelId,
@@ -677,7 +696,9 @@ export async function runEmbeddedPiAgent(
         sessionKey: params.sessionKey,
         agentHarnessId: params.agentHarnessId,
       });
+      // 判断：插件执行器是否自己掌管消息传输（发送/接收） 
       const pluginHarnessOwnsTransport = agentHarness.id !== "pi";
+      // 动态解析最终要调用的真实模型（核心！）
       const dynamicModelResolution = await resolveModelAsync(
         provider,
         modelId,
@@ -687,22 +708,28 @@ export async function runEmbeddedPiAgent(
           // Plugin dynamic model hooks can resolve explicit model refs without
           // first generating PI models.json. This keeps one-shot model runs from
           // blocking on unrelated provider discovery.
+          // 跳过自动模型发现，提高一次性执行速度
           skipPiDiscovery: true,
           workspaceDir: resolvedWorkspace,
         },
       );
+      // 最终确定模型解析结果（二选一逻辑）
       const modelResolution =
+        // 如果动态解析已经拿到有效模型  OR  插件自己管传输
         dynamicModelResolution.model || pluginHarnessOwnsTransport
-          ? dynamicModelResolution
-          : await (async () => {
-              await ensureOpenClawModelsJson(params.config, agentDir, {
+          ? dynamicModelResolution   // 情况 A：直接用动态解析的结果（最快）
+          : await (async () => {   // 情况 B：没拿到模型，必须走完整流程加载模型配置
+              await ensureOpenClawModelsJson(params.config, agentDir, {   // 确保系统模型配置文件 models.json 已生成/存在
                 workspaceDir: resolvedWorkspace,
               });
+              // 再次执行完整的模型解析
               return await resolveModelAsync(provider, modelId, agentDir, params.config, {
                 workspaceDir: resolvedWorkspace,
               });
             })();
+      // 从最终结果里解构出 4 个核心东西
       const { model, error, authStorage, modelRegistry } = modelResolution;
+      // 检查模型是否存在 → 不存在就抛专门的降级错误
       if (!model) {
         throw new FailoverError(error ?? `Unknown model: ${provider}/${modelId}`, {
           reason: "model_not_found",
@@ -712,6 +739,8 @@ export async function runEmbeddedPiAgent(
           lane: globalLane,
         });
       }
+      // 存在就把最终确定的真实模型存起来
+      // 后面真正调用 AI、发请求、推理都用这个变量
       let runtimeModel = model;
 
       const resolvedRuntimeModel = resolveEffectiveRuntimeModel({
