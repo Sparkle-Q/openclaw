@@ -1321,16 +1321,21 @@ export async function runEmbeddedPiAgent(
           failoverReason,  // 为什么降级？（限流？超时？密钥无效？）
           policy: params.authProfileFailurePolicy,   // 标记失败的策略
         });
+      //当 AI 服务商返回【过载 / 繁忙】时，先等一会儿（退避），再重试 / 换密钥，避免疯狂轰炸服务器。
       const maybeBackoffBeforeOverloadFailover = async (reason: FailoverReason | null) => {
+        // 1. 不是过载错误 或 不需要等待 → 直接跳过
         if (reason !== "overloaded" || overloadFailoverBackoffMs <= 0) {
           return;
         }
+        // 2. 打印日志：服务过载，等待 X 毫秒
         log.warn(
           `overload backoff before failover for ${provider}/${modelId}: delayMs=${overloadFailoverBackoffMs}`,
         );
         try {
+          // 3. 等待指定时间（支持中途取消）
           await sleepWithAbort(overloadFailoverBackoffMs, params.abortSignal);
         } catch (err) {
+          // 4. 如果中途被取消 → 抛出终止错误
           if (params.abortSignal?.aborted) {
             const abortErr = new Error("Operation aborted", { cause: err });
             abortErr.name = "AbortError";
@@ -1341,22 +1346,31 @@ export async function runEmbeddedPiAgent(
       };
       // Resolve the context engine once and reuse across retries to avoid
       // repeated initialization/connection overhead per attempt.
+      // 提前初始化并复用 “长记忆 / 上下文工具”，避免每次重试都重新加载，浪费时间。
+      // 全局只初始化一次上下文引擎，所有重试都复用它
+      // 避免每次失败重试都重新创建、重连，大幅提升速度
       ensureContextEnginesInitialized();
+      // 加载/获取上下文引擎（负责记忆、文件、工具、长上下文）
       const contextEngine = await resolveContextEngine(params.config, {
         agentDir,
         workspaceDir: resolvedWorkspace,
       });
+      // 上下文引擎归属的插件ID（内部用）
       const contextEnginePluginId = resolveContextEngineOwnerPluginId(contextEngine);
+      // 标记阶段：上下文引擎就绪
       startupStages.mark("context-engine");
       notifyExecutionPhase("context_engine", { provider, model: modelId });
       try {
+        // 生成当前活跃的钩子上下文（给插件/扩展用）
         const resolveActiveHookContext = () => ({
           ...hookCtx,
           sessionId: activeSessionId,
         });
+        // 接收压缩后的新会话信息（更新会话ID/文件）
         const adoptCompactionTranscript = (
           compactResult: Awaited<ReturnType<typeof contextEngine.compact>>,
         ) => {
+          // 如果压缩后生成了新会话 → 更新当前会话
           const nextSessionId = compactResult.result?.sessionId;
           const nextSessionFile = compactResult.result?.sessionFile;
           if (nextSessionId && nextSessionId !== activeSessionId) {
@@ -1366,6 +1380,7 @@ export async function runEmbeddedPiAgent(
             activeSessionFile = nextSessionFile;
           }
         };
+        // 上下文压缩事件通知（告诉外部：开始压缩 / 压缩完成）
         const onCompactionHookMessages = async (payload: {
           phase: "before" | "after";
           messages: string[];
@@ -1387,6 +1402,7 @@ export async function runEmbeddedPiAgent(
         // When the engine owns compaction, compactEmbeddedPiSessionDirect is
         // bypassed. Fire lifecycle hooks here so recovery paths still notify
         // subscribers like memory extensions and usage trackers.
+        // 执行【压缩前】的生命周期钩子（给插件用）
         const runOwnsCompactionBeforeHook = async (reason: string) => {
           if (
             contextEngine.info.ownsCompaction !== true ||
@@ -1395,6 +1411,7 @@ export async function runEmbeddedPiAgent(
             return;
           }
           try {
+            // 触发插件：before_compaction
             await hookRunner.runBeforeCompaction(
               { messageCount: -1, sessionFile: activeSessionFile },
               resolveActiveHookContext(),
@@ -1403,51 +1420,63 @@ export async function runEmbeddedPiAgent(
             log.warn(`before_compaction hook failed during ${reason}: ${String(hookErr)}`);
           }
         };
+        // 上下文压缩【完成后】执行的钩子
         const runOwnsCompactionAfterHook = async (
-          reason: string,
-          compactResult: Awaited<ReturnType<typeof contextEngine.compact>>,
+          reason: string,   // 为什么压缩（比如token溢出）
+          compactResult: Awaited<ReturnType<typeof contextEngine.compact>>,   // 压缩结果
         ) => {
+          // 如果不满足条件 → 直接跳过
           if (
-            contextEngine.info.ownsCompaction !== true ||
-            !compactResult.ok ||
-            !compactResult.compacted ||
-            !hookRunner?.hasHooks("after_compaction")
+            contextEngine.info.ownsCompaction !== true ||    // 不是引擎负责压缩
+            !compactResult.ok ||                           // 压缩失败
+            !compactResult.compacted ||                    // 根本没压缩
+            !hookRunner?.hasHooks("after_compaction")       // 没有插件监听
           ) {
             return;
           }
           try {
+            // 触发所有插件的 after_compaction 事件
             await hookRunner.runAfterCompaction(
               {
                 messageCount: -1,
                 compactedCount: -1,
-                tokenCount: compactResult.result?.tokensAfter,
+                tokenCount: compactResult.result?.tokensAfter,   // 压缩后的token数量
                 sessionFile: compactResult.result?.sessionFile ?? activeSessionFile,
               },
-              resolveActiveHookContext(),
+              resolveActiveHookContext(),    // 带上当前会话信息
             );
           } catch (hookErr) {
+            // 插件报错不影响主流程
             log.warn(`after_compaction hook failed during ${reason}: ${String(hookErr)}`);
           }
         };
+        // 是否有认证重试正在进行中（防止重复触发）
         let authRetryPending = false;
+        // 累积的会话回放状态：出错重试时，能恢复到之前的对话现场
         let accumulatedReplayState = createEmbeddedRunReplayState();
         // Hoisted so the retry-limit error path can use the most recent API total.
+        // 最后一轮对话的 token 总数（提升到外层，方便报错时使用） 
         let lastTurnTotal: number | undefined;
+        // 无限循环：AI 重试、换模型、换密钥、压缩上下文都在这里跑
         while (true) {
+          // 如果重试次数达到上限 → 终止，不再尝试
           if (runLoopIterations >= MAX_RUN_LOOP_ITERATIONS) {
             const message =
               `Exceeded retry limit after ${runLoopIterations} attempts ` +
               `(max=${MAX_RUN_LOOP_ITERATIONS}).`;
+            // 打印错误日志
             log.error(
               `[run-retry-limit] sessionKey=${params.sessionKey ?? params.sessionId} ` +
                 `provider=${provider}/${modelId} attempts=${runLoopIterations} ` +
                 `maxAttempts=${MAX_RUN_LOOP_ITERATIONS}`,
             );
+            // 决定最终怎么处理这个失败（降级？抛错？）
             const retryLimitDecision = resolveRunFailoverDecision({
               stage: "retry_limit",
               fallbackConfigured,
               failoverReason: lastRetryFailoverReason,
             });
+            // 执行最终失败处理：返回错误、上报监控、清理状态
             return handleRetryLimitExhaustion({
               message,
               decision: retryLimitDecision,
@@ -1468,41 +1497,58 @@ export async function runEmbeddedPiAgent(
               livenessState: "blocked",
             });
           }
+          // 主循环次数 +1（本轮正式开始）
           runLoopIterations += 1;
+          // 记录：上一轮是不是认证重试
           const runtimeAuthRetry = authRetryPending;
+          // 重置重试标记（本轮开始，清空pending状态）
           authRetryPending = false;
+          // 记录：本轮使用了哪种思考模式（避免重复尝试无效模式）
           attemptedThinking.add(thinkLevel);
+          // 确保工作目录存在（存放临时文件、会话、缓存）
           await fs.mkdir(resolvedWorkspace, { recursive: true });
 
+          // 构建基础提示词
+          // 优先级：临时覆盖 > 原始提示词（如果是Anthropic，清理拒绝词）
           const basePrompt =
-            nextAttemptPromptOverride ??
+            nextAttemptPromptOverride ??   // 重试/继续指令优先
             (provider === "anthropic" ? scrubAnthropicRefusalMagic(params.prompt) : params.prompt);
+          // 用完立刻清空，防止影响下一轮
           nextAttemptPromptOverride = null;
+          // 收集所有额外指令（快速通道、各种重试提示）
           const promptAdditions = [
-            ackExecutionFastPathInstruction,
-            planningOnlyRetryInstruction,
-            reasoningOnlyRetryInstruction,
-            emptyResponseRetryInstruction,
-            compactionContinuationRetryInstruction,
+            ackExecutionFastPathInstruction,      // 快速通道指令
+            planningOnlyRetryInstruction,          // 规划重试提示
+            reasoningOnlyRetryInstruction,         // 推理重试提示
+            emptyResponseRetryInstruction,         // 空返回重试提示
+            compactionContinuationRetryInstruction,   // 压缩后继续提示
           ].filter(
-            (value): value is string => typeof value === "string" && value.trim().length > 0,
+            (value): value is string => typeof value === "string" && value.trim().length > 0,   // 过滤掉空的、无效的
           );
+          // 拼接最终提示词：基础内容 + 额外指令
           const prompt =
             promptAdditions.length > 0
               ? `${basePrompt}\n\n${promptAdditions.join("\n\n")}`
               : basePrompt;
+          // 准备API密钥
           let resolvedStreamApiKey: string | undefined;
           if (!runtimeAuthState && apiKeyInfo) {
             resolvedStreamApiKey = (apiKeyInfo as ApiKeyInfo).apiKey;
           }
+          // 构建AI运行时执行计划（任务单）
           const runtimePlan = buildAgentRuntimePlan({
+            // 基础信息：服务商、模型、接口类型
             provider,
             modelId,
             model: effectiveModel,
             modelApi: effectiveModel.api,
+
+            // 代理/插件执行环境
             harnessId: agentHarness.id,
             harnessRuntime: agentHarness.id,
             allowHarnessAuthProfileForwarding: pluginHarnessOwnsTransport,
+            
+            // 认证/密钥信息（当前用哪个API Key）
             authProfileProvider:
               (lastProfileId
                 ? attemptAuthProfileStore.profiles?.[lastProfileId]?.provider
@@ -1514,36 +1560,53 @@ export async function runEmbeddedPiAgent(
             sessionAuthProfileCandidateIds: pluginHarnessOwnsTransport
               ? pluginHarnessForwardedProfileCandidates
               : undefined,
+
+            // 系统环境
             config: params.config,
-            workspaceDir: resolvedWorkspace,
-            agentDir,
+            workspaceDir: resolvedWorkspace,    // 工作目录
+            agentDir,                      // 代理目录
             agentId: workspaceResolution.agentId,
+
+            // 思考模式（深度思考 / 普通 / 快速）
             thinkingLevel: thinkLevel,
+            
+            // 流式参数、快速模式
             extraParamsOverride: {
               ...params.streamParams,
               fastMode: params.fastMode,
             },
           });
+          // 只在第一次重试时发送一次启动完成信号
           if (!startupStagesEmitted) {
+            // 标记阶段：开始发送请求
             startupStages.mark("attempt-dispatch");
+            // 通知外部系统：进入「请求派发」阶段
             notifyExecutionPhase("attempt_dispatch", { provider, model: modelId });
+            // 打印/上报启动阶段汇总日志
             emitStartupStageSummary("attempt-dispatch");
+            // 标记为已发送，后续重试不再重复执行
             startupStagesEmitted = true;
           }
-
+          // 为本次AI调用创建一个独立的中断控制器
           const attemptAbortController = new AbortController();
+          // 让“压缩后循环保护”也共用这个中断器（发现死循环时可以终止）
           postCompactionAbortController = attemptAbortController;
+          // 拿到外部传入的中断信号（比如用户手动取消）
           const parentAbortSignal = params.abortSignal;
+          // 定义：外部中断 → 同步中断本次AI请求
           const relayParentAbort = (): void => {
             attemptAbortController.abort(parentAbortSignal?.reason);
           };
+          // 如果外部已经取消 → 立刻中断
           if (parentAbortSignal?.aborted) {
             relayParentAbort();
           } else {
+            // 否则监听外部中断事件，触发时同步取消
             parentAbortSignal?.addEventListener("abort", relayParentAbort, { once: true });
           }
+          // 整个 AI 系统的 “开火按钮”: 整个 AI 系统真正执行、调用模型、生成回答、处理工具、流式输出的最终入口
           const rawAttempt = await runEmbeddedAttemptWithBackend({
-            sessionId: activeSessionId,
+            sessionId: activeSessionId, 
             sessionKey: resolvedSessionKey,
             sandboxSessionKey: params.sandboxSessionKey,
             trigger: params.trigger,
@@ -1661,10 +1724,10 @@ export async function runEmbeddedPiAgent(
             suppressNextUserMessagePersistence,
             onUserMessagePersisted,
           })
-            .catch((err: unknown): never => {
+            .catch((err: unknown): never => {  // 如果死循环保护器触发，优先抛这个错误, 否则抛原始错误, 保证死循环可以强制终止调用
               throw postCompactionAbortError ?? err;
             })
-            .finally(() => {
+            .finally(() => {   // 清理工作：调用结束无论成功失败，都清理中断监听、释放控制器，防止内存泄漏
               parentAbortSignal?.removeEventListener?.("abort", relayParentAbort);
               if (postCompactionAbortController === attemptAbortController) {
                 postCompactionAbortController = undefined;
