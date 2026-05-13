@@ -1049,35 +1049,47 @@ export async function runEmbeddedPiAgent(
         // 3. 遍历所有候选密钥，找一个能用的
         while (nextIndex < profileCandidates.length) {
           const candidate = profileCandidates[nextIndex];
+          // 情况A：没有密钥 或 密钥不允许转发给插件 → 跳过
           if (!candidate || !isForwardablePluginHarnessAuthProfile(candidate)) {
             nextIndex += 1;
             continue;
           }
+          // 情况B：密钥正在冷却（限流/刚报错）→ 暂时不能用，跳过
           if (isProfileInCooldown(attemptAuthProfileStore, candidate, undefined, modelId)) {
             nextIndex += 1;
             continue;
           }
-          profileIndex = nextIndex;
-          lastProfileId = candidate;
-          thinkLevel = initialThinkLevel;
-          attemptedThinking.clear();
-          return true;
+          // 找到可用密钥！切换过去
+          profileIndex = nextIndex;    // 更新当前索引
+          lastProfileId = candidate;   // 记录当前用的密钥
+          thinkLevel = initialThinkLevel;   // 重置思考模式
+          attemptedThinking.clear();   // 清空尝试记录
+          return true;       // 切换成功
         }
+        // 所有密钥都试完了，没可用的 → 切换失败
         return false;
       };
 
       // Plugin harnesses own their model transport/auth. Running PI's generic
+      // 关键注释：插件自己管认证，不能走系统通用认证流程，否则会冲突
       // auth bootstrap here can turn synthetic provider markers into real
       // vendor-token refresh attempts before the plugin gets control.
       if (!pluginHarnessOwnsTransport) {
+        // 普通模式：执行系统标准的认证初始化
         await initializeAuthProfile();
       } else if (lockedProfileId) {
+        // 插件模式 + 用户锁定认证：直接记录使用的认证ID
         lastProfileId = lockedProfileId;
       } else if (forwardedPluginHarnessProfileId) {
+        // 插件模式 + 转发认证：记录要转发给插件的认证
         lastProfileId = forwardedPluginHarnessProfileId;
       }
+      // 标记：认证阶段全部完成
       startupStages.mark("auth");
+      // 通知系统：进入认证完成后的阶段
       notifyExecutionPhase("auth", { provider, model: modelId });
+      // 创建本次运行使用的【作用域认证存储】
+      // 插件模式下只暴露允许转发的认证，保证安全
       const runAttemptAuthProfileStore = pluginHarnessOwnsTransport
         ? createScopedAuthProfileStore(
             attemptAuthProfileStore,
@@ -1086,13 +1098,16 @@ export async function runEmbeddedPiAgent(
               : lastProfileId,
           )
         : attemptAuthProfileStore;
+      // 解析会话相关ID
       const { sessionAgentId } = resolveSessionAgentIds({
         sessionKey: params.sessionKey,
         config: params.config,
         agentId: params.agentId,
       });
+      // 解析当前会话应该使用的【执行契约】（运行规则）
       const configuredExecutionContract =
         resolveAgentExecutionContract(params.config, sessionAgentId) ?? "default";
+      // 判断：是否启用【严格智能体模式】（严格的工具调用、多步推理）
       const strictAgenticActive = isStrictAgenticExecutionContractActive({
         config: params.config,
         sessionKey: params.sessionKey,
@@ -1100,29 +1115,50 @@ export async function runEmbeddedPiAgent(
         provider,
         modelId,
       });
+      // 最终确定执行契约（行为模式）
       const executionContract = strictAgenticActive ? "strict-agentic" : "default";
+      // 纯规划步骤最多重试几次
       const maxPlanningOnlyRetryAttempts = resolvePlanningOnlyRetryLimit(executionContract);
+      // 纯推理步骤最多重试几次（固定默认值）
       const maxReasoningOnlyRetryAttempts = DEFAULT_REASONING_ONLY_RETRY_LIMIT;
+      // 模型返回空结果时最多重试几次
       const maxEmptyResponseRetryAttempts = DEFAULT_EMPTY_RESPONSE_RETRY_LIMIT;
 
+      // 超时压缩重试次数（超时了就缩短上下文重试，最多试2次）
       const MAX_TIMEOUT_COMPACTION_ATTEMPTS = 2;
+      // 内容溢出（token太长）重试次数（最多试3次）
       const MAX_OVERFLOW_COMPACTION_ATTEMPTS = 3;
+      // 整个运行循环最大迭代次数（根据密钥数量动态计算） 
       const MAX_RUN_LOOP_ITERATIONS = resolveMaxRunRetryIterations(profileCandidates.length);
+      // token 溢出（内容太长）重试次数
       let overflowCompactionAttempts = 0;
+      // 是否做过工具结果截断
       let toolResultTruncationAttempted = false;
+      // 记录提示词警告签名（内部调试用）
       let bootstrapPromptWarningSignaturesSeen =
         params.bootstrapPromptWarningSignaturesSeen ??
         (params.bootstrapPromptWarningSignature ? [params.bootstrapPromptWarningSignature] : []);
+      // 统计 token 用量（总消耗）
       const usageAccumulator = createUsageAccumulator();
+      // 上一次对话的 token 使用量
       let lastRunPromptUsage: ReturnType<typeof normalizeUsage> | undefined;
+      // 自动压缩上下文次数
       let autoCompactionCount = 0;
+      // 上一次压缩后的 token 数量
       let lastCompactionTokensAfter: number | undefined;
+      // 主循环跑了多少次
       let runLoopIterations = 0;
+      // 因为过载（限流）切换了多少次密钥
       let overloadProfileRotations = 0;
+      // 规划步骤重试次数
       let planningOnlyRetryAttempts = 0;
+      // 推理步骤重试次数
       let reasoningOnlyRetryAttempts = 0;
+      // 空返回重试次数
       let emptyResponseRetryAttempts = 0;
+      // 压缩后重试次数
       let compactionContinuationRetryAttempts = 0;
+      // 超时重试次数
       let sameModelIdleTimeoutRetries = 0;
       // Cost-runaway breaker for #76293. State lives at the run-loop level
       // on purpose so it survives across attempt boundaries and across
@@ -1130,58 +1166,82 @@ export async function runEmbeddedPiAgent(
       // counter would reset on every iteration). The helper is pure and
       // unit-tested in run/idle-timeout-breaker.test.ts; the run loop just
       // feeds it the outcome of each attempt.
+      // 创建【空闲超时熔断保护器】
+      // 作用：防止AI一直卡住、长时间不响应、无限空转（防卡死、防烧钱）
       const idleTimeoutBreakerState = createIdleTimeoutBreakerState();
       // Post-compaction loop guard for #77474. Armed at each compaction-success
       // site below; observed from the live tool-outcome path so it can abort
       // while the post-compaction prompt is still running.
+      // 读取配置：工具循环检测规则（防止AI重复调用同一个工具死循环）
       const resolvedLoopDetectionConfig = resolveToolLoopDetectionConfig({
         cfg: params.config,
         agentId: sessionAgentId,
       });
+      // 创建【压缩后循环保护器】
+      // 作用：AI压缩上下文后，防止进入死循环重复执行
       const postCompactionGuard = createPostCompactionLoopGuard(
         resolvedLoopDetectionConfig?.postCompactionGuard,
         { enabled: resolvedLoopDetectionConfig?.enabled !== false },
       );
+      // 中断控制器：发现死循环 → 立刻强制终止AI运行
       let postCompactionAbortController: AbortController | undefined;
+      // 记录中断错误信息
       let postCompactionAbortError: PostCompactionLoopPersistedError | undefined;
+      // 监听工具执行结果：一旦发现死循环 → 立刻触发中断，停止运行
       const observePostCompactionToolOutcome = (
         observation: PostCompactionGuardObservation,
       ): void => {
         const verdict = postCompactionGuard.observe(observation);
         if (verdict.shouldAbort) {
+          // 终止！
           postCompactionAbortError ??= PostCompactionLoopPersistedError.fromVerdict(verdict);
           postCompactionAbortController?.abort(postCompactionAbortError);
         }
       };
+      // 最后一次重试降级的原因（密钥错？限流？模型挂了？）
       let lastRetryFailoverReason: FailoverReason | null = null;
+      
+      // 各种重试时要发给AI的提示语
       let planningOnlyRetryInstruction: string | null = null;
       let reasoningOnlyRetryInstruction: string | null = null;
       let emptyResponseRetryInstruction: string | null = null;
       let compactionContinuationRetryInstruction: string | null = null;
+      
+      // 强制覆盖下一次提示词（临时改prompt用）
       let nextAttemptPromptOverride: string | null = null;
+      // 执行快速通道指令（优化速度用）
       const ackExecutionFastPathInstruction = resolveAckExecutionFastPathInstruction({
         provider,
         modelId,
         prompt: params.prompt,
       });
+      // 因为限流切换了几次密钥
       let rateLimitProfileRotations = 0;
+      // 超时后压缩上下文重试次数
       let timeoutCompactionAttempts = 0;
       // Silent-error retry: non-strict-agentic models (e.g. ollama/glm-5.1) can
       // end a turn with stopReason="error" + zero output tokens, producing no
       // user-visible text. This is an orthogonal, model-agnostic resubmission
       // for errored turns; stopReason="stop" empty zero-token turns use the
       // visible-answer retry instruction instead.
+      // 静默错误重试：模型悄悄报错但不告诉用户，最多重试3次
       const MAX_EMPTY_ERROR_RETRIES = 3;
       let emptyErrorRetries = 0;
+
+      // 过载/限流后的重试等待时间、切换密钥上限
       const overloadFailoverBackoffMs = resolveOverloadFailoverBackoffMs(params.config);
       const overloadProfileRotationLimit = resolveOverloadProfileRotationLimit(params.config);
       const rateLimitProfileRotationLimit = resolveRateLimitProfileRotationLimit(params.config);
+      
+      // 当前活跃会话ID、会话文件
       let activeSessionId = params.sessionId;
       let activeSessionFile = params.sessionFile;
+      // 会话消息持久化控制（是否存历史记录）
       let suppressNextUserMessagePersistence = params.suppressNextUserMessagePersistence ?? false;
       // Pi owns JSONL persistence; this marker only lets the outer retry avoid
       // replaying the same inbound channel message after overflow compaction.
       let lastPersistedCurrentMessageId: string | number | undefined;
+      // 消息保存回调：用户消息存盘后记录一下ID，避免重复存储
       const onUserMessagePersisted: RunEmbeddedPiAgentParams["onUserMessagePersisted"] = (
         message,
       ) => {
@@ -1190,24 +1250,34 @@ export async function runEmbeddedPiAgent(
         }
         params.onUserMessagePersisted?.(message);
       };
+      // 让AI从**当前对话中断处继续执行**，而不是重新开始
       const continueFromCurrentTranscript = () => {
+        // 强制下一次提示词使用“继续执行”指令
         nextAttemptPromptOverride = MID_TURN_PRECHECK_CONTINUATION_PROMPT;
+        // 抑制：不把这次继续操作当成新的用户消息存储
         suppressNextUserMessagePersistence = true;
       };
+      // 限流熔断：如果轮换密钥太多次还限流 → 升级为“模型降级”
       const maybeEscalateRateLimitProfileFallback = (params: {
         failoverProvider: string;
         failoverModel: string;
         logFallbackDecision: (decision: "fallback_model", extra?: { status?: number }) => void;
       }) => {
+        // 1. 限流计数器 +1（又遇到一次限流）
         rateLimitProfileRotations += 1;
+        
+        // 2. 没达到上限 / 没有配置降级 → 不处理，继续重试
         if (rateLimitProfileRotations <= rateLimitProfileRotationLimit || !fallbackConfigured) {
           return;
         }
+        // 3. 达到上限！不能再轮换密钥了，必须降级
         const status = resolveFailoverStatus("rate_limit");
         log.warn(
           `rate-limit profile rotation cap reached for ${sanitizeForLog(provider)}/${sanitizeForLog(modelId)} after ${rateLimitProfileRotations} rotations; escalating to model fallback`,
         );
+        // 记录降级日志
         params.logFallbackDecision("fallback_model", { status });
+        // 4. 抛出降级错误 → 系统会自动换模型/服务商
         throw new FailoverError(
           "The AI service is temporarily rate-limited. Please try again in a moment.",
           {
@@ -1221,31 +1291,35 @@ export async function runEmbeddedPiAgent(
           },
         );
       };
+      // 标记某个认证（API Key）调用失败
       const maybeMarkAuthProfileFailure = async (failure: {
-        profileId?: string;
-        reason?: AuthProfileFailureReason | null;
+        profileId?: string;     // 哪个密钥
+        reason?: AuthProfileFailureReason | null;    // 失败原因
         config?: RunEmbeddedPiAgentParams["config"];
         agentDir?: RunEmbeddedPiAgentParams["agentDir"];
         modelId?: string;
       }) => {
         const { profileId, reason } = failure;
+        // 1. 如果没有密钥 / 没有原因 / 是超时错误 → 不标记
         if (!profileId || !reason || reason === "timeout") {
           return;
         }
+        // 2. 正式记录：这个密钥 × 失败了 × 原因是啥
         await markAuthProfileFailure({
-          store: profileFailureStore,
-          profileId,
-          reason,
+          store: profileFailureStore,    // 存在哪里
+          profileId,    // 密钥ID
+          reason,          // 失败原因（invalid、rate_limited、forbidden 等）
           cfg: params.config,
           agentDir,
           runId: params.runId,
           modelId: failure.modelId,
         });
       };
+      // 把「降级原因」转换成「认证失败原因」
       const resolveRunAuthProfileFailureReason = (failoverReason: FailoverReason | null) =>
         resolveAuthProfileFailureReason({
-          failoverReason,
-          policy: params.authProfileFailurePolicy,
+          failoverReason,  // 为什么降级？（限流？超时？密钥无效？）
+          policy: params.authProfileFailurePolicy,   // 标记失败的策略
         });
       const maybeBackoffBeforeOverloadFailover = async (reason: FailoverReason | null) => {
         if (reason !== "overloaded" || overloadFailoverBackoffMs <= 0) {
