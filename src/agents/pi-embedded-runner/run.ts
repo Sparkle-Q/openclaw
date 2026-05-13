@@ -743,6 +743,7 @@ export async function runEmbeddedPiAgent(
       // 后面真正调用 AI、发请求、推理都用这个变量
       let runtimeModel = model;
 
+      // 解析【最终生效的运行时模型】（核心：合并配置、调整参数、确定上下文窗口大小）
       const resolvedRuntimeModel = resolveEffectiveRuntimeModel({
         cfg: params.config,
         provider,
@@ -751,34 +752,47 @@ export async function runEmbeddedPiAgent(
           harnessId: agentHarness.id,
         }),
         modelId,
-        runtimeModel,
+        runtimeModel,    // 上一步确定的模型对象
       });
+      // 取出上下文信息（最大token数、窗口大小等）
       const ctxInfo = resolvedRuntimeModel.ctxInfo;
+      // 最终确定、真正用于调用的模型
       let effectiveModel = resolvedRuntimeModel.effectiveModel;
+      // 性能打点：模型解析阶段完成
       startupStages.mark("model-resolution");
+      // 通知外部：进入【模型解析完成】阶段
       notifyExecutionPhase("model_resolution", { provider, model: modelId });
 
+      // 创建【认证存储】（存放 API Key、配置、权限）
       const authStore = pluginHarnessOwnsTransport
-        ? createEmptyAuthProfileStore()
-        : ensureAuthProfileStoreWithoutExternalProfiles(agentDir, {
-            allowKeychainPrompt: false,
+        ? createEmptyAuthProfileStore()  // 如果是插件自己管消息 → 用空的认证存储（不需要系统提供密钥）
+        : ensureAuthProfileStoreWithoutExternalProfiles(agentDir, {  // 否则 → 加载系统正常的认证存储（读取本地的 API Key）
+            allowKeychainPrompt: false,   // 不弹出密钥提示
           });
+      // 用于【尝试认证】的存储（备用/兜底）
       const attemptAuthProfileStore = pluginHarnessOwnsTransport
-        ? ensureAuthProfileStoreWithoutExternalProfiles(agentDir, {
+        ? ensureAuthProfileStoreWithoutExternalProfiles(agentDir, {   // 插件模式：必须用真实存储去尝试调用
             allowKeychainPrompt: false,
           })
-        : authStore;
+        : authStore;  // 普通模式：直接用上面的主存储
+      // 用户/调用方 请求使用的认证配置 ID
       const requestedProfileId = params.authProfileId?.trim();
+      // 标记：这个认证配置是不是【用户手动指定的】（锁定不可自动替换）
       const requestedProfileIsUserLocked = params.authProfileIdSource === "user";
+      // 判断插件是否可以【转发/使用】这个认证配置
       const isForwardablePluginHarnessAuthProfile = (
         profileId: string | undefined,
       ): profileId is string => {
+        // 1. 如果不是插件模式 或 没有 profileId → 直接不能转发
         if (!pluginHarnessOwnsTransport || !profileId) {
           return false;
         }
+        // 2. 从认证存储里获取这个 ID 对应的凭证
         const credential = attemptAuthProfileStore.profiles?.[profileId];
+        // 3. 构建【运行时认证计划】——计算这个认证应该怎么用
         const runtimeAuthPlan = buildAgentRuntimeAuthPlan({
           provider,
+          // 优先用凭证里的 provider，没有就从 profileId 截取前缀
           authProfileProvider: credential?.provider ?? profileId.split(":", 1)[0],
           authProfileMode: credential?.type,
           sessionAuthProfileId: profileId,
@@ -786,19 +800,26 @@ export async function runEmbeddedPiAgent(
           workspaceDir: resolvedWorkspace,
           harnessId: agentHarness.id,
           harnessRuntime: agentHarness.id,
-          allowHarnessAuthProfileForwarding: true,
+          allowHarnessAuthProfileForwarding: true,  // 允许插件转发认证
         });
+        // 最终判断：计划转发的 ID 是不是等于传入的 ID
+        // 相等 = 安全、合法、可以转发
         return runtimeAuthPlan.forwardedAuthProfileId === profileId;
       };
+      // 给插件模式生成一个「可安全使用的认证配置优先级列表」，告诉系统按什么顺序尝试 API Key。
       const resolvePluginHarnessProfileOrder = (): string[] => {
+        // 1. 如果用户手动指定了认证ID，并且锁定不可修改
         if (requestedProfileId && requestedProfileIsUserLocked) {
+          // 检查这个ID是否允许插件转发
           return isForwardablePluginHarnessAuthProfile(requestedProfileId)
-            ? [requestedProfileId]
-            : [];
+            ? [requestedProfileId]   // 允许 → 只用这一个
+            : [];                    // 不允许 → 空列表，不能用
         }
+        // 2. 如果不是插件自己管传输 → 不需要插件认证列表
         if (!pluginHarnessOwnsTransport) {
           return [];
         }
+        // 3. 构建运行时认证计划，获取插件支持的服务商
         const runtimeAuthPlan = buildAgentRuntimeAuthPlan({
           provider,
           config: params.config,
@@ -808,37 +829,51 @@ export async function runEmbeddedPiAgent(
           allowHarnessAuthProfileForwarding: true,
         });
         const harnessAuthProvider = runtimeAuthPlan.harnessAuthProvider;
+        // 4. 插件没有指定支持的服务商 → 无法提供列表
         if (!harnessAuthProvider) {
           return [];
         }
+        // 5. 解析出当前服务商下所有可用的认证，并过滤出【允许插件转发】的
         const resolvedOrder = resolveAuthProfileOrder({
           cfg: params.config,
           store: attemptAuthProfileStore,
           provider: harnessAuthProvider,
         }).filter(isForwardablePluginHarnessAuthProfile);
+        // 6. 有可用的 → 返回排序后的列表
         if (resolvedOrder.length > 0) {
           return resolvedOrder;
         }
+        // 7. 兜底：如果上面没找到，再看用户指定的是否可用
         if (requestedProfileId && isForwardablePluginHarnessAuthProfile(requestedProfileId)) {
           return [requestedProfileId];
         }
+        // 8. 全都不可用 → 空列表
         return [];
       };
+      // 如果是插件自己管传输 → 获取可用认证列表，否则空数组
       const pluginHarnessProfileOrder = pluginHarnessOwnsTransport
         ? resolvePluginHarnessProfileOrder()
         : [];
+      // 取列表里第一个（优先级最高的认证）
       const resolvePluginHarnessPreferredProfileId = (): string | undefined =>
         pluginHarnessProfileOrder[0];
+      // 最终优先使用的认证ID
+      // 插件模式 → 用上面算出的首选
+      // 普通模式 → 用用户请求的
       const preferredProfileId = pluginHarnessOwnsTransport
         ? resolvePluginHarnessPreferredProfileId()
         : requestedProfileId;
+      // 初始锁定认证ID：只有用户手动指定的才锁定
       let lockedProfileId = requestedProfileIsUserLocked ? preferredProfileId : undefined;
+      // 如果有锁定ID → 校验合法性，不合法就清空（不锁定）
       if (lockedProfileId) {
         if (pluginHarnessOwnsTransport) {
+          // 插件模式：必须是可转发的才保留，否则取消锁定
           if (!isForwardablePluginHarnessAuthProfile(lockedProfileId)) {
             lockedProfileId = undefined;
           }
         } else {
+          // 普通模式：检查锁定的认证 服务商 是否和当前运行的服务商一致
           const lockedProfile = authStore.profiles[lockedProfileId];
           const lockedProfileProvider = lockedProfile
             ? resolveProviderIdForAuth(lockedProfile.provider, {
@@ -850,38 +885,45 @@ export async function runEmbeddedPiAgent(
             config: params.config,
             workspaceDir: resolvedWorkspace,
           });
+          // 服务商不匹配 → 取消锁定
           if (!lockedProfile || !lockedProfileProvider || lockedProfileProvider !== runProvider) {
             lockedProfileId = undefined;
           }
         }
       }
+      // 插件模式：最终要【转发给插件】的认证ID
       const forwardedPluginHarnessProfileId =
         pluginHarnessOwnsTransport &&
         !lockedProfileId &&
-        isForwardablePluginHarnessAuthProfile(preferredProfileId)
-          ? preferredProfileId
-          : undefined;
+        isForwardablePluginHarnessAuthProfile(preferredProfileId)  // 允许转发
+          ? preferredProfileId   // 满足 → 转发首选认证
+          : undefined;          // 不满足 → 不转发
+      // 普通模式 + 有锁定认证 → 校验认证是否【合法、能用】
       if (lockedProfileId && !pluginHarnessOwnsTransport) {
+        // 检查这个认证是否适用于当前服务商
         const eligibility = resolveAuthProfileEligibility({
           cfg: params.config,
           store: authStore,
           provider,
           profileId: lockedProfileId,
         });
+        // 不合法 → 直接抛错，终止运行
         if (!eligibility.eligible) {
           throw new Error(`Auth profile "${lockedProfileId}" is not configured for ${provider}.`);
         }
       }
+      // 生成【认证尝试顺序列表】（主密钥→备用密钥）
       const profileOrder = shouldPreferExplicitConfigApiKeyAuth(params.config, provider)
-        ? []
+        ? []  // 如果用环境变量/配置文件密钥 → 不用列表
         : resolveAuthProfileOrder({
             cfg: params.config,
             store: authStore,
             provider,
-            preferredProfile: preferredProfileId,
+            preferredProfile: preferredProfileId,  // 首选认证排第一
           });
+      // 服务商（如OpenAI）自己推荐的认证ID
       const providerPreferredProfileId = lockedProfileId
-        ? undefined
+        ? undefined  // 有用户锁定 → 不使用服务商推荐
         : resolveProviderAuthProfileId({
             provider,
             config: params.config,
@@ -898,6 +940,7 @@ export async function runEmbeddedPiAgent(
               authStore,
             },
           });
+      // 构建认证候选顺序
       const providerOrderedProfiles =
         providerPreferredProfileId && profileOrder.includes(providerPreferredProfileId)
           ? [
@@ -905,6 +948,7 @@ export async function runEmbeddedPiAgent(
               ...profileOrder.filter((profileId) => profileId !== providerPreferredProfileId),
             ]
           : profileOrder;
+      // 把服务商推荐的密钥放到最前面优先尝试。
       const profileCandidates = pluginHarnessOwnsTransport
         ? lockedProfileId
           ? [lockedProfileId]
