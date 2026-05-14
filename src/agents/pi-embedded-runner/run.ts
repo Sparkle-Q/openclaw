@@ -1733,32 +1733,39 @@ export async function runEmbeddedPiAgent(
                 postCompactionAbortController = undefined;
               }
             });
+          // 如果之前触发了【压缩后死循环熔断】，直接抛错终止整个流程
           if (postCompactionAbortError) {
             throw postCompactionAbortError;
           }
+          // 把模型返回的原始结果，标准化成系统能识别的格式
           const attempt = normalizeEmbeddedRunAttemptResult(rawAttempt);
 
+          // 把 attempt 结果里的关键状态全部解构出来
           const {
-            aborted,
-            externalAbort,
-            promptError,
-            promptErrorSource,
-            preflightRecovery,
-            timedOut,
-            idleTimedOut,
-            timedOutDuringCompaction,
-            sessionIdUsed,
-            sessionFileUsed,
-            lastAssistant: sessionLastAssistant,
-            currentAttemptAssistant,
+            aborted,      // 调用被中止了吗？
+            externalAbort,   // 外部主动取消了吗？
+            promptError,     // 提示词错误？
+            promptErrorSource,    // 哪个提示词错了？
+            preflightRecovery,    // 需要预检恢复？
+            timedOut,    // 超时了？
+            idleTimedOut,    // 空闲超时？
+            timedOutDuringCompaction,   // 压缩上下文时超时？
+            sessionIdUsed,    // 本次实际使用的会话 ID
+            sessionFileUsed,   // 本次实际使用的会话文件
+            lastAssistant: sessionLastAssistant,    // 最后一轮助手消息
+            currentAttemptAssistant,    // 本轮助手返回内容
           } = attempt;
+          // 工具执行时是否超时
           const timedOutDuringToolExecution = attempt.timedOutDuringToolExecution ?? false;
+          // 如果本次用了新的会话 ID → 更新全局会话
           if (sessionIdUsed && sessionIdUsed !== activeSessionId) {
             activeSessionId = sessionIdUsed;
           }
+          // 如果本次用了新的会话文件 → 更新全局会话文件
           if (sessionFileUsed && sessionFileUsed !== activeSessionFile) {
             activeSessionFile = sessionFileUsed;
           }
+          // 收集并保存所有见过的「引导提示词警告签名」（去重）
           bootstrapPromptWarningSignaturesSeen =
             attempt.bootstrapPromptWarningSignaturesSeen ??
             (attempt.bootstrapPromptWarningSignature
@@ -1769,23 +1776,31 @@ export async function runEmbeddedPiAgent(
                   ]),
                 )
               : bootstrapPromptWarningSignaturesSeen);
+          // 标准化本次AI返回的Token用量数据
           const lastAssistantUsage = normalizeUsage(sessionLastAssistant?.usage as UsageLike);
           const attemptUsage = attempt.attemptUsage ?? lastAssistantUsage;
+          // 把本次消耗的Token，累加到全局总计数器里
           mergeUsageIntoAccumulator(usageAccumulator, attemptUsage);
           // Keep prompt size from the latest model call so session totalTokens
           // reflects current context usage, not accumulated tool-loop usage.
+          // 1. 保存【最新一次】的prompt token用量
+          // 只记当前上下文大小，不累计工具循环的重复用量
           lastRunPromptUsage = lastAssistantUsage ?? attemptUsage;
           lastTurnTotal = lastAssistantUsage?.total ?? attemptUsage?.total;
           // Idle-timeout cost-runaway breaker (#76293). Logic lives in the
           // pure helper below so it stays unit-testable; the run loop just
           // feeds it the latest attempt outcome and bails through the
           // existing retry-limit exhaustion path when the cap is hit.
+          // 2. 【防失控断路器】
+          // 防止AI因空闲超时无限重试、无限烧token（核心安全机制）
           const breakerStep = stepIdleTimeoutBreaker(idleTimeoutBreakerState, {
-            idleTimedOut,
-            completedModelProgress: hasCompletedModelProgressForIdleBreaker(attempt),
-            outputTokens: attemptUsage?.output,
+            idleTimedOut,            // 是否空闲超时
+            completedModelProgress: hasCompletedModelProgressForIdleBreaker(attempt),   // 是否真的产生了有效输出
+            outputTokens: attemptUsage?.output,     // 输出了多少token
           });
-          if (breakerStep.tripped) {
+          // 空闲超时断路器触发: AI 连续发呆、不干活、一直超时 → 系统强制停机，防止疯狂烧钱！
+          if (breakerStep.tripped) {   // 如果断路器被触发（连续空闲超时太多次）
+            // 构造错误信息：连续 idle 超时太多次，停机保钱
             const breakerMessage =
               `Idle-timeout cost-runaway breaker tripped: ` +
               `${breakerStep.consecutive} consecutive idle timeouts ` +
@@ -1793,6 +1808,7 @@ export async function runEmbeddedPiAgent(
               `(cap=${MAX_CONSECUTIVE_IDLE_TIMEOUTS_BEFORE_OUTPUT}). ` +
               `Halting further attempts to bound paid model calls. ` +
               `See issue #76293.`;
+            // 打印【断路器触发】的错误日志（监控、告警、排查用）
             log.error(
               `[idle-timeout-circuit-breaker-tripped] ` +
                 `sessionKey=${params.sessionKey ?? params.sessionId} ` +
@@ -1800,33 +1816,42 @@ export async function runEmbeddedPiAgent(
                 `consecutive=${breakerStep.consecutive} ` +
                 `cap=${MAX_CONSECUTIVE_IDLE_TIMEOUTS_BEFORE_OUTPUT}`,
             );
+            // 计算：断路器触发后，系统该怎么处理这次失败？
             const breakerDecision = resolveRunFailoverDecision({
-              stage: "retry_limit",
-              fallbackConfigured,
-              failoverReason: lastRetryFailoverReason,
+              stage: "retry_limit",     // 归类为“重试超限”
+              fallbackConfigured,    // 是否配置了降级/备用模型
+              failoverReason: lastRetryFailoverReason,    // 上一次失败原因
             });
+            // 直接返回【重试超限/熔断】的最终结果
             return handleRetryLimitExhaustion({
+              // 错误提示：空闲超时断路器触发，停止调用
               message: breakerMessage,
+              // 决策：终止、降级还是重试（这里一定是终止）
               decision: breakerDecision,
+              // 现场信息：服务商、模型、密钥ID、耗时
               provider,
               model: modelId,
               profileId: lastProfileId,
               durationMs: Date.now() - started,
+              // 错误元数据：会话ID、token消耗统计
               agentMeta: buildErrorAgentMeta({
                 sessionId: activeSessionId,
                 provider,
                 model: model.id,
                 contextTokens: ctxInfo.tokens,
-                usageAccumulator,
-                lastRunPromptUsage,
+                usageAccumulator,   // 总token消耗
+                lastRunPromptUsage,   // 最后一次调用用量
                 lastTurnTotal,
               }),
+              // 回放状态 & 存活状态：标记为阻塞、不可用
               replayInvalid: accumulatedReplayState.replayInvalid ? true : undefined,
               livenessState: "blocked",
             });
           }
+          // 累加上下文压缩次数（对话太长自动精简的次数）
           const attemptCompactionCount = Math.max(0, attempt.compactionCount ?? 0);
           autoCompactionCount += attemptCompactionCount;
+          // 记录最后一次压缩后的 token 数量
           if (
             typeof attempt.compactionTokensAfter === "number" &&
             Number.isFinite(attempt.compactionTokensAfter) &&
@@ -1834,24 +1859,30 @@ export async function runEmbeddedPiAgent(
           ) {
             lastCompactionTokensAfter = Math.floor(attempt.compactionTokensAfter);
           }
+          // 构建【当前错误现场信息】（方便后面报错、日志、调试）
           const activeErrorContext = resolveActiveErrorContext({
             provider,
             model: modelId,
             assistant: currentAttemptAssistant ?? sessionLastAssistant,
           });
+          // 计算：本次对话是否【无法回放/恢复】（系统异常恢复用）
           const resolveReplayInvalidForAttempt = (incompleteTurnText?: string | null) =>
             accumulatedReplayState.replayInvalid ||
             resolveReplayInvalidFlag({
               attempt,
               incompleteTurnText,
             });
+          // 如果本次执行标记为【无法回放/恢复】，就永久锁定状态
+          // 防止系统重试一个注定失败的会话
           if (resolveReplayInvalidForAttempt(null)) {
             accumulatedReplayState.replayInvalid = true;
           }
+          // 更新回放元数据（用于系统崩溃后恢复对话现场）
           accumulatedReplayState = observeReplayMetadata(
             accumulatedReplayState,
             attempt.replayMetadata,
           );
+          // 如果AI助手返回了错误，把错误格式化成人类可读的文本
           const formattedAssistantErrorText = sessionLastAssistant
             ? formatAssistantErrorText(sessionLastAssistant, {
                 cfg: params.config,
@@ -1860,28 +1891,36 @@ export async function runEmbeddedPiAgent(
                 model: activeErrorContext.model,
               })
             : undefined;
+          // 提取最终错误信息：优先原生错误，否则用格式化后的文案
           const assistantErrorText =
             sessionLastAssistant?.stopReason === "error"
               ? sessionLastAssistant.errorMessage?.trim() || formattedAssistantErrorText
               : undefined;
+          // 判断：能不能安全重启（无副作用热切换）
+          // 条件：还没发消息、没执行工具、没输出文字 → 可以悄悄重试
           const canRestartForLiveSwitch =
-            !hasMessagingToolDeliveryEvidence(attempt) &&
-            !attempt.didSendDeterministicApprovalPrompt &&
-            !attempt.lastToolError &&
-            (attempt.toolMetas?.length ?? 0) === 0 &&
-            (attempt.assistantTexts?.length ?? 0) === 0;
+            !hasMessagingToolDeliveryEvidence(attempt) &&   // 没发过消息
+            !attempt.didSendDeterministicApprovalPrompt &&   // 没发过确认提示
+            !attempt.lastToolError &&      // 没工具错误
+            (attempt.toolMetas?.length ?? 0) === 0 &&        // 没调用过工具
+            (attempt.assistantTexts?.length ?? 0) === 0;    // 没输出任何文字
+          // 如果【预检恢复】处理了（比如上下文溢出自动压缩）
           if (preflightRecovery?.handled) {
             const retryingFromTranscript = preflightRecovery.source === "mid-turn";
+            // 打日志：上下文溢出，自动自救成功
             log.info(
               `[context-overflow-precheck] early recovery route=${preflightRecovery.route} ` +
                 `completed for ${provider}/${modelId}; ` +
                 (retryingFromTranscript ? "retrying from current transcript" : "retrying prompt"),
             );
+            // 从当前对话继续重试
             if (retryingFromTranscript) {
               continueFromCurrentTranscript();
             }
+            // 回到循环开头，重新跑一次
             continue;
           }
+          // 询问系统：是否需要在当前会话中，**实时切换到另一个模型**？
           const requestedSelection = shouldSwitchToLiveModel({
             cfg: params.config,
             sessionKey: resolvedSessionKey,
@@ -1893,43 +1932,61 @@ export async function runEmbeddedPiAgent(
             currentAuthProfileId: preferredProfileId,
             currentAuthProfileIdSource: params.authProfileIdSource,
           });
+          // 如果需要切换 **并且** 可以安全重启（前面判断的 canRestartForLiveSwitch）
+          // 意味着：还没输出任何内容，切换无副作用
           if (requestedSelection && canRestartForLiveSwitch) {
+            // 清除切换标记
             await clearLiveModelSwitchPending({
               cfg: params.config,
               sessionKey: resolvedSessionKey,
               agentId: params.agentId,
             });
+            // 打印日志：正在切换模型
             log.info(
               `live session model switch requested during active attempt for ${params.sessionId}: ${provider}/${modelId} -> ${requestedSelection.provider}/${requestedSelection.model}`,
             );
+            // 抛出一个特定错误，通知上层循环：我要换模型啦！
             throw new LiveSessionModelSwitchError(requestedSelection);
           }
           // ── Timeout-triggered compaction ──────────────────────────────────
           // When the LLM times out with high context usage, compact before
           // retrying to break the death spiral of repeated timeouts.
+          // 超时触发式上下文压缩
+          // 如果：模型超时了 + 不是压缩时超时 + 不是工具执行时超时
           if (timedOut && !timedOutDuringCompaction && !timedOutDuringToolExecution) {
             // Only consider prompt-side tokens here. API totals include output
             // tokens, which can make a long generation look like high context
             // pressure even when the prompt itself was small.
             const lastTurnPromptTokens = derivePromptTokens(lastRunPromptUsage);
+            // 计算：Prompt 占上下文预算的比例
             const tokenUsedRatio =
               lastTurnPromptTokens != null && ctxInfo.tokens > 0
                 ? lastTurnPromptTokens / ctxInfo.tokens
                 : 0;
+            // 如果已经达到【最大超时压缩次数】
             if (timeoutCompactionAttempts >= MAX_TIMEOUT_COMPACTION_ATTEMPTS) {
+              // 打警告日志：压缩次数超限，放弃压缩，走备用方案
               log.warn(
                 `[timeout-compaction] already attempted timeout compaction ${timeoutCompactionAttempts} time(s); falling through to failover rotation`,
               );
-            } else if (tokenUsedRatio > 0.65) {
+            } else if (tokenUsedRatio > 0.65) {   // 如果：占比太高（>65%）
+              // 生成一个唯一ID，用来追踪这次压缩操作（日志/调试用）
               const timeoutDiagId = createCompactionDiagId();
+              // 压缩次数 +1（记录这是第几次尝试）
               timeoutCompactionAttempts++;
+              // 打警告日志：
+              // LLM 超时了，因为提示词 Token 占比太高（XX%）
+              // 准备执行上下文压缩，这是第 X 次尝试
               log.warn(
                 `[timeout-compaction] LLM timed out with high prompt token usage (${Math.round(tokenUsedRatio * 100)}%); ` +
                   `attempting compaction before retry (attempt ${timeoutCompactionAttempts}/${MAX_TIMEOUT_COMPACTION_ATTEMPTS}) diagId=${timeoutDiagId}`,
               );
+              // 定义变量，用来接收压缩结果
               let timeoutCompactResult: Awaited<ReturnType<typeof contextEngine.compact>>;
+              // 执行压缩前的钩子函数（超时恢复场景）
               await runOwnsCompactionBeforeHook("timeout recovery");
               try {
+                // 打包压缩需要的所有运行环境参数（会话、模型、权限、工具等）
                 const timeoutCompactionRuntimeContext = {
                   ...buildEmbeddedCompactionRuntimeContext({
                     sessionKey: params.sessionKey,
@@ -1978,6 +2035,7 @@ export async function runEmbeddedPiAgent(
                   attempt: timeoutCompactionAttempts,
                   maxAttempts: MAX_TIMEOUT_COMPACTION_ATTEMPTS,
                 };
+                // 真正执行：上下文压缩（精简对话历史）
                 timeoutCompactResult = await contextEngine.compact({
                   sessionId: activeSessionId,
                   sessionKey: params.sessionKey,
@@ -1991,25 +2049,33 @@ export async function runEmbeddedPiAgent(
                 log.warn(
                   `[timeout-compaction] contextEngine.compact() threw during timeout recovery for ${provider}/${modelId}: ${String(compactErr)}`,
                 );
+                // 压缩失败 → 标记失败，不崩溃
                 timeoutCompactResult = {
                   ok: false,
                   compacted: false,
                   reason: String(compactErr),
                 };
               }
+              // 如果压缩成功（对话历史被精简了）
               if (timeoutCompactResult.compacted) {
+                // 把【压缩后的新对话记录】应用到当前会话
                 adoptCompactionTranscript(timeoutCompactResult);
               }
+              // 执行压缩完成后的钩子函数（统一做后续处理）
               await runOwnsCompactionAfterHook("timeout recovery", timeoutCompactResult);
+              // 如果【上下文压缩成功】（对话已精简，Token变少）
               if (timeoutCompactResult.compacted) {
+                // 1. 自动压缩次数 +1
                 autoCompactionCount += 1;
                 if (
                   typeof timeoutCompactResult.result?.tokensAfter === "number" &&
                   Number.isFinite(timeoutCompactResult.result.tokensAfter) &&
                   timeoutCompactResult.result.tokensAfter > 0
                 ) {
+                  // 2. 记录压缩后剩余的 Token 数量
                   lastCompactionTokensAfter = Math.floor(timeoutCompactResult.result.tokensAfter);
                 }
+                // 3. 如果上下文引擎需要，执行压缩后的副作用（保存文件、更新状态等）
                 if (contextEngine.info.ownsCompaction === true) {
                   await runPostCompactionSideEffects({
                     config: params.config,
@@ -2017,23 +2083,29 @@ export async function runEmbeddedPiAgent(
                     sessionFile: activeSessionFile,
                   });
                 }
+                // 4. 日志：压缩成功，准备重试
                 log.info(
                   `[timeout-compaction] compaction succeeded for ${provider}/${modelId}; retrying prompt`,
                 );
+                // 5. 开启压缩保护（防止死循环）
                 postCompactionGuard.armPostCompaction();
+                // 6.  回到 while 循环开头，**重新调用模型**
                 continue;
-              } else {
+              } else {  // 如果【压缩失败】（没变小）
+                // 打警告日志，交给后面的正常错误处理
                 log.warn(
                   `[timeout-compaction] compaction did not reduce context for ${provider}/${modelId}; falling through to normal handling`,
                 );
               }
             }
           }
-
+          // 如果调用没有被中止，就开始检查错误类型
           const contextOverflowError = !aborted
             ? (() => {
+              // 情况1：前端/预检就报错了
                 if (promptError) {
                   const errorText = formatErrorMessage(promptError);
+                  // 判断：是不是「上下文溢出/Token超限」错误？
                   if (isLikelyContextOverflowError(errorText)) {
                     return { text: errorText, source: "promptError" as const };
                   }
@@ -2041,21 +2113,29 @@ export async function runEmbeddedPiAgent(
                   // inspect prior assistant errors from history for this attempt.
                   return null;
                 }
+                // 情况2：模型返回了错误
                 if (assistantErrorText && isLikelyContextOverflowError(assistantErrorText)) {
                   return {
                     text: assistantErrorText,
                     source: "assistantError" as const,
                   };
                 }
+                // 都不是
                 return null;
               })()
             : null;
 
+          // 如果检测到是【上下文溢出错误】（提示词太长超限）
           if (contextOverflowError) {
+            // 1. 生成唯一ID，方便追踪这次错误
             const overflowDiagId = createCompactionDiagId();
+            // 2. 取出错误信息
             const errorText = contextOverflowError.text;
+            // 3. 本次对话有多少条消息
             const msgCount = attempt.messagesSnapshot?.length ?? 0;
+            // 4. 从错误信息里提取：模型说超限了多少 Token
             const observedOverflowTokens = extractObservedOverflowTokenCount(errorText);
+            // 5. 打详细警告日志（监控/排查/统计用）
             log.warn(
               `[context-overflow-diag] sessionKey=${params.sessionKey ?? params.sessionId} ` +
                 `provider=${provider}/${modelId} source=${contextOverflowError.source} ` +
@@ -2064,31 +2144,47 @@ export async function runEmbeddedPiAgent(
                 `observedTokens=${observedOverflowTokens ?? "unknown"} ` +
                 `error=${errorText.slice(0, 200)}`,
             );
+            // 6. 判断：是不是【压缩也救不了】的致命错误
             const isCompactionFailure = isCompactionFailureError(errorText);
+            // 7. 本次调用之前是否已经尝试过压缩
             const hadAttemptLevelCompaction = attemptCompactionCount > 0;
             // If this attempt already compacted (SDK auto-compaction), avoid immediately
             // running another explicit compaction for the same overflow trigger.
+            // 如果：
+            // 1. 不是压缩失败错误
+            // 2. 本次调用里【已经自动压缩过一次】
+            // 3. 还没超过最大压缩次数
             if (
               !isCompactionFailure &&
               hadAttemptLevelCompaction &&
               overflowCompactionAttempts < MAX_OVERFLOW_COMPACTION_ATTEMPTS
             ) {
+              // 压缩次数 +1
               overflowCompactionAttempts++;
+              // 打日志：溢出还在，但刚压过，不重复压，直接重试
               log.warn(
                 `context overflow persisted after in-attempt compaction (attempt ${overflowCompactionAttempts}/${MAX_OVERFLOW_COMPACTION_ATTEMPTS}); retrying prompt without additional compaction for ${provider}/${modelId}`,
               );
+              // 如果预检恢复的来源是「对话中途（mid-turn）」
               if (preflightRecovery?.source === "mid-turn") {
+                // 从当前已有的对话记录继续重试，而不是回到最开始
                 continueFromCurrentTranscript();
               }
+              // 回到循环开头，**直接重试**，不再做压缩
               continue;
             }
             // Attempt explicit overflow compaction only when this attempt did not
             // already auto-compact.
+            // 只有满足以下所有条件，才执行【手动上下文压缩】：
+            // 1. 不是压缩失败错误（还能救）
+            // 2. 本次调用里 没有 自动压缩过（避免重复压缩）
+            // 3. 还没达到最大压缩次数（防止死循环）
             if (
               !isCompactionFailure &&
               !hadAttemptLevelCompaction &&
               overflowCompactionAttempts < MAX_OVERFLOW_COMPACTION_ATTEMPTS
             ) {
+              // 打印调试日志：准备开始压缩
               if (log.isEnabled("debug")) {
                 log.debug(
                   `[compaction-diag] decision diagId=${overflowDiagId} branch=compact ` +
@@ -2096,11 +2192,15 @@ export async function runEmbeddedPiAgent(
                     `attempt=${overflowCompactionAttempts + 1} maxAttempts=${MAX_OVERFLOW_COMPACTION_ATTEMPTS}`,
                 );
               }
+              // 压缩次数 +1（记录这是第几次尝试）
               overflowCompactionAttempts++;
+              // 打印警告日志：发现上下文溢出，开始自动压缩
               log.warn(
                 `context overflow detected (attempt ${overflowCompactionAttempts}/${MAX_OVERFLOW_COMPACTION_ATTEMPTS}); attempting auto-compaction for ${provider}/${modelId}`,
               );
+              // 定义变量，接收压缩结果
               let compactResult: Awaited<ReturnType<typeof contextEngine.compact>>;
+              // 执行【压缩前钩子】（超时/溢出恢复的统一前置逻辑）
               await runOwnsCompactionBeforeHook("overflow recovery");
               try {
                 const overflowCompactionRuntimeContext = {
@@ -2153,20 +2253,27 @@ export async function runEmbeddedPiAgent(
                   attempt: overflowCompactionAttempts,
                   maxAttempts: MAX_OVERFLOW_COMPACTION_ATTEMPTS,
                 };
+                // 调用上下文引擎，执行【强制压缩】
                 compactResult = await contextEngine.compact({
-                  sessionId: activeSessionId,
+                  sessionId: activeSessionId,      // 哪个会话
                   sessionKey: params.sessionKey,
-                  sessionFile: activeSessionFile,
-                  tokenBudget: ctxInfo.tokens,
+                  sessionFile: activeSessionFile,    // 对话记录文件
+                  tokenBudget: ctxInfo.tokens,       // 模型允许的最大 Token
+
+                  // 如果错误信息里说了超了多少 Token，直接告诉压缩引擎
                   ...(observedOverflowTokens !== undefined
                     ? { currentTokenCount: observedOverflowTokens }
                     : {}),
-                  force: true,
-                  compactionTarget: "budget",
-                  runtimeContext: overflowCompactionRuntimeContext,
+                  force: true,   // 强制压缩（必须压）
+                  compactionTarget: "budget",      // 压缩到模型预算内
+                  runtimeContext: overflowCompactionRuntimeContext,    // 运行环境
                 });
+                // 如果：压缩成功 + 确实把对话变小了
                 if (compactResult.ok && compactResult.compacted) {
+                  // 1. 应用【压缩后的新对话历史】
+                  // 把旧的、太长的对话 → 替换成精简版
                   adoptCompactionTranscript(compactResult);
+                  // 执行上下文引擎维护（保存文件、更新索引、清理缓存）
                   await runContextEngineMaintenance({
                     contextEngine,
                     sessionId: activeSessionId,
@@ -2178,16 +2285,18 @@ export async function runEmbeddedPiAgent(
                     agentId: sessionAgentId,
                   });
                 }
-              } catch (compactErr) {
+              } catch (compactErr) {   // 如果压缩上下文时抛出异常（报错了）
+                // 打印警告日志：压缩失败，原因是什么
                 log.warn(
                   `contextEngine.compact() threw during overflow recovery for ${provider}/${modelId}: ${String(compactErr)}`,
                 );
+                // 手动返回一个【失败结果】，告诉系统：压缩没成功
                 compactResult = {
-                  ok: false,
-                  compacted: false,
-                  reason: String(compactErr),
+                  ok: false,        // 不成功
+                  compacted: false,      // 没压缩成功
+                  reason: String(compactErr),      // 失败原因
                 };
-              }
+              }  
               await runOwnsCompactionAfterHook("overflow recovery", compactResult);
               if (compactResult.compacted) {
                 adoptCompactionTranscript(compactResult);
