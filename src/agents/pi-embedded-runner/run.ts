@@ -2510,7 +2510,10 @@ export async function runEmbeddedPiAgent(
               },
             };
           }
-
+          // 条件：
+          // 1. 有模型调用错误
+          // 2. 没有被主动中止
+          // 3. 错误**不是**来自压缩流程（避免重复处理）
           if (promptError && !aborted && promptErrorSource !== "compaction") {
             // Normalize wrapped errors (e.g. abort-wrapped RESOURCE_EXHAUSTED) into
             // FailoverError so rate-limit classification works even for nested shapes.
@@ -2518,6 +2521,7 @@ export async function runEmbeddedPiAgent(
             // promptErrorSource === "compaction" means the model call already completed and the
             // abort happened only while waiting for compaction/retry cleanup. Retrying from here
             // would replay that completed tool turn as a fresh prompt attempt.
+            // 把各种嵌套、包装过的错误（如限流、资源耗尽）统一标准化成 FailoverError
             const normalizedPromptFailover = coerceToFailoverError(promptError, {
               provider: activeErrorContext.provider,
               model: activeErrorContext.model,
@@ -2525,10 +2529,13 @@ export async function runEmbeddedPiAgent(
               sessionId: sessionIdUsed,
               lane: globalLane,
             });
+            // 提取标准化后的错误详情（类型、原因、是否可重试、是否触发容灾）
             const promptErrorDetails = normalizedPromptFailover
               ? describeFailoverError(normalizedPromptFailover)
               : describeFailoverError(promptError);
+            // 如果标准化后的错误标记了【需要暂停会话】
             if (normalizedPromptFailover?.suspend) {
+              // 执行：冻结/暂停当前会话
               void suspendSession({
                 cfg: params.config,
                 agentDir,
@@ -2539,18 +2546,26 @@ export async function runEmbeddedPiAgent(
                 failedModel: normalizedPromptFailover.model ?? modelId,
               });
             }
+            // 拿到最终的错误信息
             const errorText = promptErrorDetails.message || formatErrorMessage(promptError);
+            // 判断：是不是【登录过期/鉴权失败】？
+            //    如果是 → 尝试自动刷新令牌/重新登录
+            //    刷新成功 → 继续重试（continue）
             if (await maybeRefreshRuntimeAuthForAuthError(errorText, runtimeAuthRetry)) {
-              authRetryPending = true;
-              continue;
+              authRetryPending = true;   // 标记：正在处理鉴权重试
+              continue;     // 回到循环开头，用新令牌重新执行
             }
             // Handle role ordering errors with a user-friendly message
+            // 处理【角色顺序错误】，返回用户友好提示
             if (/incorrect role information|roles must alternate/i.test(errorText)) {
+              // 标记会话：阻塞、不可重试
               attempt.setTerminalLifecycleMeta?.({
                 replayInvalid: resolveReplayInvalidForAttempt(),
                 livenessState: "blocked",
               });
+              // // 检测到角色顺序错误 → 直接返回友好错误，终止流程
               return {
+                // 给用户看的友好提示
                 payloads: [
                   {
                     text:
@@ -2580,12 +2595,15 @@ export async function runEmbeddedPiAgent(
               };
             }
             // Handle image size errors with a user-friendly message (no retry needed)
+            // 处理图片大小错误，返回用户友好提示（不需要重试）
             const imageSizeError = parseImageSizeError(errorText);
+            // 如果检测到是图片大小错误
             if (imageSizeError) {
               const maxMb = imageSizeError.maxMb;
               const maxMbLabel =
                 typeof maxMb === "number" && Number.isFinite(maxMb) ? `${maxMb}` : null;
               const maxBytesHint = maxMbLabel ? ` (max ${maxMbLabel}MB)` : "";
+              // 标记会话：阻塞、不可重试
               attempt.setTerminalLifecycleMeta?.({
                 replayInvalid: resolveReplayInvalidForAttempt(),
                 livenessState: "blocked",
@@ -2619,14 +2637,19 @@ export async function runEmbeddedPiAgent(
                 },
               };
             }
+            // 确定失败原因：是限流？欠费？模型不可用？
             const promptFailoverReason =
               promptErrorDetails.reason ?? classifyFailoverReason(errorText, { provider });
+            // 映射成账号/权限维度的失败类型
             const promptProfileFailureReason =
               resolveRunAuthProfileFailureReason(promptFailoverReason);
+            // 判断：这个错误是否属于【需要容灾切换】的类型
             const promptFailoverFailure =
               promptFailoverReason !== null || isFailoverErrorMessage(errorText, { provider });
             // Capture the failing profile before auth-profile rotation mutates `lastProfileId`.
+            // 记录当前是哪个账号/配置失败了（方便后续切换）
             const failedPromptProfileId = lastProfileId;
+            // 创建一个【容灾决策日志】记录器
             const logPromptFailoverDecision = createFailoverDecisionLogger({
               stage: "prompt",
               runId: params.runId,
@@ -2641,37 +2664,44 @@ export async function runEmbeddedPiAgent(
               fallbackConfigured,
               aborted,
             });
+            // 如果错误原因是：接口限流（rate_limit）
             if (promptFailoverReason === "rate_limit") {
+              // 执行：限流自动升级/降级/切换账号策略
               maybeEscalateRateLimitProfileFallback({
                 failoverProvider: provider,
                 failoverModel: modelId,
                 logFallbackDecision: logPromptFailoverDecision,
               });
             }
+            // 最终决策：这次失败了，接下来该怎么办？
             let promptFailoverDecision = resolveRunFailoverDecision({
-              stage: "prompt",
-              aborted,
-              externalAbort,
-              fallbackConfigured,
-              failoverFailure: promptFailoverFailure,
-              failoverReason: promptFailoverReason,
-              profileRotated: false,
+              stage: "prompt",    // 错误发生在：生成提示词阶段
+              aborted,           // 是否主动中止
+              externalAbort,      // 是否外部中止
+              fallbackConfigured,         // 是否配置了备用方案（账号/模型）
+              failoverFailure: promptFailoverFailure,      // 是否属于需要容灾的错误
+              failoverReason: promptFailoverReason,        // 错误原因（限流/欠费/挂了）
+              profileRotated: false,             // 是否已经切换过账号
             });
+            // 如果最终决策是：切换账号
             if (
               promptFailoverDecision.action === "rotate_profile" &&
               (await (pluginHarnessOwnsTransport
                 ? advancePluginHarnessAuthProfile()
                 : advanceAuthProfile()))
             ) {
+              // 如果切换成功：
+              // 把刚才失败的账号标记为「故障账号」，暂时不用它
               if (failedPromptProfileId && promptProfileFailureReason) {
                 void maybeMarkAuthProfileFailure({
-                  profileId: failedPromptProfileId,
-                  reason: promptProfileFailureReason,
+                  profileId: failedPromptProfileId,    // 刚才挂掉的账号
+                  reason: promptProfileFailureReason,   // 挂掉原因：限流/欠费/不可用
                   modelId,
                 }).catch((err) => {
                   log.warn(`prompt profile failure mark failed: ${String(err)}`);
                 });
               }
+              // 把这次失败记录到追踪日志里（方便调试：哪个模型、为啥挂了）
               traceAttempts.push({
                 provider,
                 model: modelId,
@@ -2679,15 +2709,22 @@ export async function runEmbeddedPiAgent(
                 ...(promptFailoverReason ? { reason: promptFailoverReason } : {}),
                 stage: "prompt",
               });
+              // 合并失败原因（汇总多次重试的错误类型）
               lastRetryFailoverReason = mergeRetryFailoverReason({
                 previous: lastRetryFailoverReason,
                 failoverReason: promptFailoverReason,
               });
+              // 打印日志：已成功切换账号/配置
               logPromptFailoverDecision("rotate_profile");
+              // 退避等待：避免切换太快导致雪崩（限流时等一小下）
               await maybeBackoffBeforeOverloadFailover(promptFailoverReason);
+              // 回到主循环，用新账号/新模型重新执行！
               continue;
             }
+            // 如果上一步决策是：切换账号
             if (promptFailoverDecision.action === "rotate_profile") {
+              // 重新计算最终决策
+              // 关键区别：profileRotated: true（标记：已经切过一次账号了）
               promptFailoverDecision = resolveRunFailoverDecision({
                 stage: "prompt",
                 aborted,
@@ -2698,34 +2735,44 @@ export async function runEmbeddedPiAgent(
                 profileRotated: true,
               });
             }
+            // 如果有失败的账号，并且知道失败原因
             if (failedPromptProfileId && promptProfileFailureReason) {
               try {
-                await maybeMarkAuthProfileFailure({
-                  profileId: failedPromptProfileId,
-                  reason: promptProfileFailureReason,
-                  modelId,
+                // 执行：标记这个账号 = 故障/不可用
+                await maybeMarkAuthProfileFailure({  
+                  profileId: failedPromptProfileId,   // 刚刚挂掉的账号ID
+                  reason: promptProfileFailureReason,  // 失败原因：限流/欠费/无权限
+                  modelId,                         // 哪个模型报错
                 });
               } catch (err) {
                 log.warn(`prompt profile failure mark failed: ${String(err)}`);
               }
             }
+            // 从错误信息里，自动选出【模型支持的降级思考级别】
             const fallbackThinking = pickFallbackThinkingLevel({
-              message: errorText,
-              attempted: attemptedThinking,
+              message: errorText,    // 错误信息
+              attempted: attemptedThinking,    // 刚才尝试用的思考级别（比如 deep / heavy）
             });
+            // 如果找到了可用的降级方案
             if (fallbackThinking) {
               log.warn(
                 `unsupported thinking level for ${provider}/${modelId}; retrying with ${fallbackThinking}`,
               );
+              // 切换到降级后的思考级别
               thinkLevel = fallbackThinking;
+              // 回到主循环，用降级后的配置重新执行
               continue;
             }
             // Throw FailoverError for prompt-side failover reasons when fallbacks
             // are configured so outer model fallback can continue on overload,
             // rate-limit, auth, or billing failures.
+            // 如果最终决策是：切换到备用模型
             if (promptFailoverDecision.action === "fallback_model") {
+              // 获取失败原因
               const fallbackReason = promptFailoverDecision.reason ?? "unknown";
+              // 解析错误状态码（用于监控）
               const status = resolveFailoverStatus(fallbackReason);
+              // 1. 记录这次失败到追踪日志（方便排查：哪个模型、为什么切）
               traceAttempts.push({
                 provider,
                 model: modelId,
@@ -2734,8 +2781,11 @@ export async function runEmbeddedPiAgent(
                 stage: "prompt",
                 ...(typeof status === "number" ? { status } : {}),
               });
+              // 2. 打印日志：已切换到备用模型
               logPromptFailoverDecision("fallback_model", { status });
+              // 3. 限流/过载时，短暂等待一下，防止雪崩
               await maybeBackoffBeforeOverloadFailover(promptFailoverReason);
+              // 抛出最终的、标准化的错误
               throw (
                 normalizedPromptFailover ??
                 new FailoverError(errorText, {
@@ -2749,7 +2799,9 @@ export async function runEmbeddedPiAgent(
                 })
               );
             }
+            // 如果最终决策是：暴露错误（不自救、不重试、不容灾）
             if (promptFailoverDecision.action === "surface_error") {
+              // 1. 记录错误现场（方便调试） 
               traceAttempts.push({
                 provider,
                 model: modelId,
@@ -2757,42 +2809,59 @@ export async function runEmbeddedPiAgent(
                 ...(promptFailoverReason ? { reason: promptFailoverReason } : {}),
                 stage: "prompt",
               });
+              // 打印日志：已决定直接报错
               logPromptFailoverDecision("surface_error");
             }
+            // 直接抛出错误，结束所有流程
             throw promptError;
           }
 
+          // 拿到当前对话的助手信息（找错误信息用）
           const assistantForFailover = currentAttemptAssistant ?? sessionLastAssistant;
+          // 从错误信息里判断：是不是“不支持当前思考深度”
+          // 如果是，自动返回一个降级后的思考级别（比如 low → off）
           const fallbackThinking = pickFallbackThinkingLevel({
             message: assistantForFailover?.errorMessage,
             attempted: attemptedThinking,
           });
+          // 如果需要降级，并且会话没有被取消
           if (fallbackThinking && !aborted) {
             log.warn(
               `unsupported thinking level for ${provider}/${modelId}; retrying with ${fallbackThinking}`,
             );
+            // 切换到降级后的思考级别
             thinkLevel = fallbackThinking;
+            // 回到循环顶部，重新执行请求
             continue;
           }
-
+          // 检查是不是【鉴权/登录/Token 错误】（比如 API Key 无效）
           const authFailure = isAuthAssistantError(assistantForFailover);
+          // 检查是不是【限流错误】（调用太快/太多）
           const rateLimitFailure = isRateLimitAssistantError(assistantForFailover);
+          // 检查是不是【欠费/配额不足】
           const billingFailure = isBillingAssistantError(assistantForFailover);
+          // 检查是不是【需要容灾/切换账号】的通用错误
           const failoverFailure = isFailoverAssistantError(assistantForFailover);
+          // 详细分类：到底是哪种容灾错误（限流/欠费/无权限等）
           const assistantFailoverReason = classifyFailoverReason(
             assistantForFailover?.errorMessage ?? "",
             {
               provider: assistantForFailover?.provider,
             },
           );
+          // 映射成【账号级】的失败原因（用于标记账号失效）
           const assistantProfileFailureReason =
             resolveRunAuthProfileFailureReason(assistantFailoverReason);
+          // 检查是不是【代码/格式错误】
           const cloudCodeAssistFormatError = attempt.cloudCodeAssistFormatError;
+          // 检查是不是【图片尺寸/分辨率错误】
           const imageDimensionError = parseImageDimensionError(
             assistantForFailover?.errorMessage ?? "",
           );
           // Capture the failing profile before auth-profile rotation mutates `lastProfileId`.
+          // 记录：当前是哪个账号（API Key）失败了
           const failedAssistantProfileId = lastProfileId;
+          // 创建【容灾决策日志记录器】
           const logAssistantFailoverDecision = createFailoverDecisionLogger({
             stage: "assistant",
             runId: params.runId,
@@ -2808,18 +2877,23 @@ export async function runEmbeddedPiAgent(
             timedOut,
             aborted,
           });
-
+          // 如果是【鉴权失败】（Token过期/API Key失效）
           if (
             authFailure &&
+            // 尝试自动刷新鉴权信息（重新登录、获取新Token）
             (await maybeRefreshRuntimeAuthForAuthError(
               assistantForFailover?.errorMessage ?? "",
               runtimeAuthRetry,
             ))
           ) {
+            // 标记：正在处理鉴权刷新重试
             authRetryPending = true;
+            // 回到主循环，用新的鉴权信息重新执行
             continue;
           }
+          // 如果是图片分辨率/尺寸错误，并且有当前账号ID
           if (imageDimensionError && lastProfileId) {
+            // 组装详细的错误信息：哪张图片、限制多大
             const details = [
               imageDimensionError.messageIndex !== undefined
                 ? `message=${imageDimensionError.messageIndex}`
@@ -2833,11 +2907,12 @@ export async function runEmbeddedPiAgent(
             ]
               .filter(Boolean)
               .join(" ");
+            // 打印警告日志：哪个账号拒绝了这张图片，原因是什么
             log.warn(
               `Profile ${lastProfileId} rejected image payload${details ? ` (${details})` : ""}.`,
             );
           }
-
+          // 大脑决策：模型助手响应失败了，接下来该怎么办？
           const assistantFailoverDecision = resolveRunFailoverDecision({
             stage: "assistant",
             allowFormatRetry: cloudCodeAssistFormatError,
@@ -2851,6 +2926,7 @@ export async function runEmbeddedPiAgent(
             timedOutDuringToolExecution,
             profileRotated: false,
           });
+          // 执行最终的容灾/重试操作
           const assistantFailoverOutcome = await handleAssistantFailover({
             initialDecision: assistantFailoverDecision,
             aborted,
@@ -2894,12 +2970,16 @@ export async function runEmbeddedPiAgent(
               ? advancePluginHarnessAuthProfile
               : advanceAuthProfile,
           });
+          // 记录过载时的账号轮换次数（内部状态）
           overloadProfileRotations = assistantFailoverOutcome.overloadProfileRotations;
+          // 如果最终决策是：重试
           if (assistantFailoverOutcome.action === "retry") {
+            // 1. 把这次失败记录到追踪日志（黑匣子）
             traceAttempts.push({
               provider: activeErrorContext.provider,
               model: activeErrorContext.model,
               result:
+                // 判断结果类型：超时重试 / 切账号重试
                 assistantFailoverOutcome.retryKind === "same_model_idle_timeout" ||
                 assistantFailoverReason === "timeout"
                   ? "timeout"
@@ -2907,10 +2987,13 @@ export async function runEmbeddedPiAgent(
               ...(assistantFailoverReason ? { reason: assistantFailoverReason } : {}),
               stage: "assistant",
             });
+            // 2. 如果是【空闲超时】导致的原地重试，给重试次数 +1（防无限循环）
             if (assistantFailoverOutcome.retryKind === "same_model_idle_timeout") {
               sameModelIdleTimeoutRetries += 1;
             }
+            // 3. 记录最后一次失败原因
             lastRetryFailoverReason = assistantFailoverOutcome.lastRetryFailoverReason;
+            // 4. 回到主循环，重新执行请求！
             continue;
           }
           if (assistantFailoverOutcome.action === "throw") {
