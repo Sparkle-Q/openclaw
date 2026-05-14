@@ -2297,17 +2297,23 @@ export async function runEmbeddedPiAgent(
                   reason: String(compactErr),      // 失败原因
                 };
               }  
+              // 执行【压缩完成后的钩子函数】
               await runOwnsCompactionAfterHook("overflow recovery", compactResult);
               if (compactResult.compacted) {
+                // 应用压缩后的对话记录（让压缩真正生效）
                 adoptCompactionTranscript(compactResult);
+                // 安全校验：如果压缩结果返回了合法的 token 数量
                 if (
                   typeof compactResult.result?.tokensAfter === "number" &&
                   Number.isFinite(compactResult.result.tokensAfter) &&
                   compactResult.result.tokensAfter > 0
                 ) {
+                  // 记录【压缩后最终剩余的token数量】（取整数）
                   lastCompactionTokensAfter = Math.floor(compactResult.result.tokensAfter);
                 }
+                // 如果预检恢复的策略是：【先压缩、再截断】
                 if (preflightRecovery?.route === "compact_then_truncate") {
+                  // 执行：截断会话里【超大的工具结果】
                   const truncResult = await truncateOversizedToolResultsInSession({
                     sessionFile: activeSessionFile,
                     contextWindowTokens: ctxInfo.tokens,
@@ -2320,24 +2326,29 @@ export async function runEmbeddedPiAgent(
                     sessionKey: params.sessionKey,
                     config: params.config,
                   });
+                  // 如果：成功截断了超长的工具结果
                   if (truncResult.truncated) {
                     log.info(
                       `[context-overflow-precheck] post-compaction tool-result truncation succeeded for ` +
                         `${provider}/${modelId}; truncated ${truncResult.truncatedCount} tool result(s)`,
                     );
-                  } else {
+                  } else {   // 如果：没有截断 / 截断没用
                     log.warn(
                       `[context-overflow-precheck] post-compaction tool-result truncation did not help for ` +
                         `${provider}/${modelId}: ${truncResult.reason ?? "unknown"}`,
                     );
                   }
                 }
+                // 自动压缩成功次数 +1（统计用）
                 autoCompactionCount += 1;
+                // 日志：压缩成功，开始重试 Prompt
                 log.info(`auto-compaction succeeded for ${provider}/${modelId}; retrying prompt`);
+                // 防死循环保护：压缩后只允许重试一次
                 postCompactionGuard.armPostCompaction();
+                // 如果是对话中途出错 → 从当前位置继续，不回退
                 if (preflightRecovery?.source === "mid-turn") {
                   continueFromCurrentTranscript();
-                } else if (
+                } else if (  // 如果是已经持久化的消息 → 特殊处理，不重复执行
                   params.currentMessageId !== undefined &&
                   params.currentMessageId === lastPersistedCurrentMessageId
                 ) {
@@ -2347,19 +2358,24 @@ export async function runEmbeddedPiAgent(
                   nextAttemptPromptOverride = MID_TURN_PRECHECK_CONTINUATION_PROMPT;
                   suppressNextUserMessagePersistence = true;
                 }
+                // 回到主循环开头，**重新调用模型**
                 continue;
               }
               log.warn(
                 `auto-compaction failed for ${provider}/${modelId}: ${compactResult.reason ?? "nothing to compact"}`,
               );
             }
+            // 如果还没有尝试过【截断超长工具结果】
             if (!toolResultTruncationAttempted) {
+              // 获取模型最大 Token 上限
               const contextWindowTokens = ctxInfo.tokens;
+              // 计算：工具结果最大允许多少字符
               const toolResultMaxChars = resolveLiveToolResultMaxChars({
                 contextWindowTokens,
                 cfg: params.config,
                 agentId: sessionAgentId,
               });
+              // 检查当前对话里，是否存在【超大、超长的工具返回值】
               const hasOversized = attempt.messagesSnapshot
                 ? sessionLikelyHasOversizedToolResults({
                     messages: attempt.messagesSnapshot,
@@ -2367,13 +2383,16 @@ export async function runEmbeddedPiAgent(
                     maxCharsOverride: toolResultMaxChars,
                   })
                 : false;
-
+              // 如果检查发现：确实有【超长、超大的工具返回结果】
               if (hasOversized) {
+                // 标记：已经尝试过截断（防止重复执行）
                 toolResultTruncationAttempted = true;
+                // 日志：准备截断超长工具结果
                 log.warn(
                   `[context-overflow-recovery] Attempting tool result truncation for ${provider}/${modelId} ` +
                     `(contextWindow=${contextWindowTokens} tokens)`,
                 );
+                // 执行真正的【截断超长工具结果】操作
                 const truncResult = await truncateOversizedToolResultsInSession({
                   sessionFile: activeSessionFile,
                   contextWindowTokens,
@@ -2382,13 +2401,16 @@ export async function runEmbeddedPiAgent(
                   sessionKey: params.sessionKey,
                   config: params.config,
                 });
+                // 如果：成功截断了超长的工具结果
                 if (truncResult.truncated) {
                   log.info(
                     `[context-overflow-recovery] Truncated ${truncResult.truncatedCount} tool result(s); retrying prompt`,
                   );
+                  // 如果是对话中途出错 → 从当前位置续跑，不回退
                   if (preflightRecovery?.source === "mid-turn") {
                     continueFromCurrentTranscript();
                   }
+                  // 回到主循环，重新调用模型
                   continue;
                 }
                 log.warn(
@@ -2396,6 +2418,9 @@ export async function runEmbeddedPiAgent(
                 );
               }
             }
+            // 如果：
+            // 1. 压缩彻底失败（救不活），或者
+            // 2. 已经达到最大压缩次数（不能再试了）
             if (
               (isCompactionFailure ||
                 overflowCompactionAttempts >= MAX_OVERFLOW_COMPACTION_ATTEMPTS) &&
@@ -2407,12 +2432,16 @@ export async function runEmbeddedPiAgent(
                   `attempt=${overflowCompactionAttempts} maxAttempts=${MAX_OVERFLOW_COMPACTION_ATTEMPTS}`,
               );
             }
+            // 判断错误类型：压缩失败 / 纯上下文溢出
             const kind = isCompactionFailure ? "compaction_failure" : "context_overflow";
+            // 给本次尝试打上【最终失败】标记
             attempt.setTerminalLifecycleMeta?.({
-              replayInvalid: resolveReplayInvalidForAttempt(),
-              livenessState: "blocked",
+              replayInvalid: resolveReplayInvalidForAttempt(),    // 标记不可重放
+              livenessState: "blocked",             // 状态：阻塞/失败
             });
+            // 最终返回：上下文溢出错误，无法修复
             return {
+              // 给用户看的错误信息
               payloads: [
                 {
                   text:
@@ -2421,6 +2450,7 @@ export async function runEmbeddedPiAgent(
                   isError: true,
                 },
               ],
+              // 系统内部元数据（日志、监控、调试用）
               meta: {
                 durationMs: Date.now() - started,
                 agentMeta: buildErrorAgentMeta({
@@ -2441,16 +2471,23 @@ export async function runEmbeddedPiAgent(
               },
             };
           }
-
+          // 如果错误来自【Agent运行前的钩子】，并且任务没有被主动中止
           if (promptErrorSource === "hook:before_agent_run" && !aborted) {
+            // 格式化错误信息，变成可读文本
             const errorText = formatErrorMessage(promptError);
+            // 判断这个失败的请求是否还能重试/重放
             const replayInvalid = resolveReplayInvalidForAttempt();
+            // 给本次会话打上【终端失败标记】：阻塞、不可重试
             attempt.setTerminalLifecycleMeta?.({
               replayInvalid,
               livenessState: "blocked",
             });
+              
+            // 直接返回错误给用户，不再继续执行
             return {
+              // 前端展示给用户的错误消息
               payloads: [{ text: errorText, isError: true }],
+              // 日志/监控/调试用的元数据
               meta: {
                 durationMs: Date.now() - started,
                 agentMeta: buildErrorAgentMeta({
