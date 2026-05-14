@@ -2996,7 +2996,9 @@ export async function runEmbeddedPiAgent(
             // 4. 回到主循环，重新执行请求！
             continue;
           }
+          // 如果最终决策是：抛出错误（彻底救不活了）
           if (assistantFailoverOutcome.action === "throw") {
+            // 1. 记录最后一次失败现场（黑匣子日志）
             traceAttempts.push({
               provider: activeErrorContext.provider,
               model: activeErrorContext.model,
@@ -3012,6 +3014,7 @@ export async function runEmbeddedPiAgent(
                 ? { status: assistantFailoverOutcome.error.status }
                 : {}),
             });
+            // 2. 如果错误需要【挂起会话】（比如账号彻底挂了）
             if (assistantFailoverOutcome.error.suspend) {
               void suspendSession({
                 cfg: params.config,
@@ -3023,19 +3026,23 @@ export async function runEmbeddedPiAgent(
                 failedModel: assistantFailoverOutcome.error.model ?? modelId,
               });
             }
+            // 3. 最终：抛出错误，结束所有流程
             throw assistantFailoverOutcome.error;
           }
+          // 组装 Token 用量统计（总消耗、本轮消耗、提示词消耗）
           const usageMeta = buildUsageAgentMetaFields({
             usageAccumulator,
             lastAssistantUsage: sessionLastAssistant?.usage as UsageLike | undefined,
             lastRunPromptUsage,
             lastTurnTotal,
           });
+          // 解析最终要上报的模型信息（统一格式：服务商+模型名）
           const reportedModelRef = resolveReportedModelRef({
             provider,
             model: model.id,
             assistant: sessionLastAssistant,
           });
+          // 最终打包：完整的 Agent 元数据（日志/监控用）
           const agentMeta: EmbeddedPiAgentMeta = {
             sessionId: sessionIdUsed,
             sessionFile: sessionFileUsed,
@@ -3049,9 +3056,11 @@ export async function runEmbeddedPiAgent(
             compactionCount: autoCompactionCount > 0 ? autoCompactionCount : undefined,
             compactionTokensAfter: lastCompactionTokensAfter,
           };
+          // 处理最终返回给用户的文本（可见内容 + 原始内容）
           const finalAssistantVisibleText = resolveFinalAssistantVisibleText(sessionLastAssistant);
           const finalAssistantRawText = resolveFinalAssistantRawText(sessionLastAssistant);
 
+          // 构建最终要返回的「响应数据包」
           const payloads = buildEmbeddedRunPayloads({
             assistantTexts: attempt.assistantTexts,
             toolMetas: attempt.toolMetas,
@@ -3072,13 +3081,16 @@ export async function runEmbeddedPiAgent(
             didSendDeterministicApprovalPrompt: attempt.didSendDeterministicApprovalPrompt,
             heartbeatToolResponse: attempt.heartbeatToolResponse,
           });
+          // 合并工具返回的图片、音频、媒体文件到最终响应里
           const payloadsWithToolMedia = mergeAttemptToolMediaPayloads({
-            payloads,
-            toolMediaUrls: attempt.toolMediaUrls,
-            toolAudioAsVoice: attempt.toolAudioAsVoice,
+            payloads,     // 上一步构建好的基础响应
+            toolMediaUrls: attempt.toolMediaUrls,   // 工具生成的图片/文件链接
+            toolAudioAsVoice: attempt.toolAudioAsVoice,   // 工具音频是否用语音播放
           });
+          // 标记：是否是【提示词阶段超时】（正常请求超时，不是压缩/工具超时）
           const timedOutDuringPrompt =
             timedOut && !timedOutDuringCompaction && !timedOutDuringToolExecution;
+          // 标记：提示词超时后，是否还有【部分返回文本】（模型只返回了一半内容）
           const hasPartialAssistantTextAfterPromptTimeout =
             timedOutDuringPrompt &&
             (attempt.assistantTexts ?? []).some((text) => text.trim().length > 0) &&
@@ -3088,25 +3100,34 @@ export async function runEmbeddedPiAgent(
             !attempt.didSendDeterministicApprovalPrompt &&
             !attempt.lastToolError &&
             (attempt.toolMetas?.length ?? 0) === 0;
+          // 构建工具调用总结日志（用了哪些工具、是否失败）
           const attemptToolSummary = buildTraceToolSummary({
             toolMetas: attempt.toolMetas,
             hadFailure: Boolean(attempt.lastToolError),
           });
+          // 计算：是否需要向外发送【失败/终止信号】
           const failureSignal = resolveEmbeddedRunFailureSignal({
-            trigger: params.trigger,
-            lastToolError: attempt.lastToolError,
+            trigger: params.trigger,    // 触发方式：手动 / 定时任务 / API调用
+            lastToolError: attempt.lastToolError, // 最后一次工具调用是否报错
           });
 
           // Timeout aborts can leave the run without payloads or with only a
           // partial assistant fragment. Emit an explicit timeout error instead,
           // preserving any tool payloads that succeeded before the timeout.
+          // 超时中断可能导致响应不完整（只有半截文字/没有内容）
+          // 这种情况不要直接崩溃，而是返回一个明确的【超时错误】
+          // 同时保留超时之前已经成功执行的工具结果
+          // 如果是【提示词阶段超时】，并且没有消息工具发送的证据（没发出去）
           if (timedOutDuringPrompt && !hasMessagingToolDeliveryEvidence(attempt)) {
+            // 根据超时类型，生成【友好的超时提示文案】
             const timeoutText = idleTimedOut
               ? "The model did not produce a response before the model idle timeout. " +
                 "Please try again, or increase `models.providers.<id>.timeoutSeconds` for slow local or self-hosted providers."
               : "Request timed out before a response was generated. " +
                 "Please try again, or increase `agents.defaults.timeoutSeconds` in your config.";
+            // 标记：这次尝试无效，不可重播/重试
             const replayInvalid = resolveReplayInvalidForAttempt(null);
+            // 解析最终运行状态（是否完成、是否中断、是否超时）
             const livenessState = resolveRunLivenessState({
               payloadCount: hasPartialAssistantTextAfterPromptTimeout ? 0 : payloads.length,
               aborted,
@@ -3114,6 +3135,7 @@ export async function runEmbeddedPiAgent(
               attempt,
               incompleteTurnText: null,
             });
+            // 给本次尝试设置【最终的、不可改变的生命周期元数据】
             attempt.setTerminalLifecycleMeta?.({
               replayInvalid,
               livenessState,
@@ -3150,6 +3172,8 @@ export async function runEmbeddedPiAgent(
             };
           }
 
+          // 构建【静默工具结果】的兜底回复
+          // 场景：定时任务、无有效返回、需要静默成功时使用
           const silentToolResultReplyPayload = resolveSilentToolResultReplyPayload({
             isCronTrigger: params.trigger === "cron",
             payloadCount: payloadsWithToolMedia?.length ?? 0,
@@ -3157,19 +3181,24 @@ export async function runEmbeddedPiAgent(
             timedOut,
             attempt,
           });
+          // 最终确定要返回的 payload 列表
+          // 优先级：真实返回 > 静默兜底 > 空数组
           const payloadsForTerminalPath = payloadsWithToolMedia?.length
             ? payloadsWithToolMedia
             : silentToolResultReplyPayload
               ? [silentToolResultReplyPayload]
               : payloadsWithToolMedia;
+          // 统计最终返回条数
           const payloadCount = payloadsForTerminalPath?.length ?? 0;
+          // 判断：空的助手回复是否需要【静默处理】
           const emptyAssistantReplyIsSilent = shouldTreatEmptyAssistantReplyAsSilent({
-            allowEmptyAssistantReplyAsSilent: params.allowEmptyAssistantReplyAsSilent,
+            allowEmptyAssistantReplyAsSilent: params.allowEmptyAssistantReplyAsSilent,  // 配置项：是否允许把空回复当成静默成功
             payloadCount,
             aborted,
             timedOut,
             attempt,
           });
+          // 生成【下一次纯规划重试指令】
           const nextPlanningOnlyRetryInstruction = emptyAssistantReplyIsSilent
             ? null
             : resolvePlanningOnlyRetryInstruction({
@@ -3181,6 +3210,7 @@ export async function runEmbeddedPiAgent(
                 timedOut,
                 attempt,
               });
+          // 生成【纯推理重试指令】（针对模型推理失败）
           const nextReasoningOnlyRetryInstruction = emptyAssistantReplyIsSilent
             ? null
             : resolveReasoningOnlyRetryInstruction({
@@ -3192,6 +3222,7 @@ export async function runEmbeddedPiAgent(
                 timedOut,
                 attempt,
               });
+          // 生成【空响应重试指令】（针对模型完全没返回内容）
           const nextEmptyResponseRetryInstruction = emptyAssistantReplyIsSilent
             ? null
             : resolveEmptyResponseRetryInstruction({
@@ -3204,13 +3235,18 @@ export async function runEmbeddedPiAgent(
                 timedOut,
                 attempt,
               });
+          // 如果：有规划重试指令 + 还没超过最大重试次数
           if (
             nextPlanningOnlyRetryInstruction &&
             planningOnlyRetryAttempts < maxPlanningOnlyRetryAttempts
           ) {
+            // 把模型返回的所有文本拼接起来
             const planningOnlyText = (attempt.assistantTexts ?? []).join("\n\n").trim();
+            // 从文本里【提取规划详情】（步骤、说明、目标）
             const planDetails = extractPlanningOnlyPlanDetails(planningOnlyText);
+            // 如果成功提取到规划 → 发送事件通知
             if (planDetails) {
+              // 发送系统级规划事件
               emitAgentPlanEvent({
                 runId: params.runId,
                 ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
@@ -3222,6 +3258,7 @@ export async function runEmbeddedPiAgent(
                   source: "planning_only_retry",
                 },
               });
+              // 回调通知调用方（前端/上层系统）
               void params.onAgentEvent?.({
                 stream: "plan",
                 data: {
@@ -3233,33 +3270,52 @@ export async function runEmbeddedPiAgent(
                 },
               });
             }
+            // 纯规划重试次数 +1（避免无限循环）
             planningOnlyRetryAttempts += 1;
+            // 更新重试指令：使用下一次的重试配置
             planningOnlyRetryInstruction = nextPlanningOnlyRetryInstruction;
+            // 打警告日志：记录触发了纯规划重试（方便排查问题）
             log.warn(
               `planning-only turn detected: runId=${params.runId} sessionId=${params.sessionId} ` +
                 `provider=${provider}/${modelId} contract=${executionContract} configured=${configuredExecutionContract} — retrying ` +
                 `${planningOnlyRetryAttempts}/${maxPlanningOnlyRetryAttempts} with act-now steer`,
             );
+            // 回到循环顶部，重新执行（强制模型去执行，而不是只规划）
             continue;
           }
+          // 判断条件：
+          // 1. 没有规划重试（不是只规划不执行）
+          // 2. 有纯推理重试指令（模型只推理不输出）
+          // 3. 还没超过最大推理重试次数
           if (
             !nextPlanningOnlyRetryInstruction &&
             nextReasoningOnlyRetryInstruction &&
             reasoningOnlyRetryAttempts < maxReasoningOnlyRetryAttempts
           ) {
+            // 1. 推理重试次数 +1（防无限循环）
             reasoningOnlyRetryAttempts += 1;
+            // 2. 保存最新的重试指令
             reasoningOnlyRetryInstruction = nextReasoningOnlyRetryInstruction;
+            // 3. 打警告日志，方便排查
             log.warn(
               `reasoning-only assistant turn detected: runId=${params.runId} sessionId=${params.sessionId} ` +
                 `provider=${activeErrorContext.provider}/${activeErrorContext.model} — retrying ${reasoningOnlyRetryAttempts}/${maxReasoningOnlyRetryAttempts} ` +
                 `with visible-answer continuation`,
             );
+            // 4. 回到循环顶部，重新执行
             continue;
           }
+          // 先判断：纯推理重试是否已经耗尽（备用状态）
           const reasoningOnlyRetriesExhausted =
             !nextPlanningOnlyRetryInstruction &&
             nextReasoningOnlyRetryInstruction &&
             reasoningOnlyRetryAttempts >= maxReasoningOnlyRetryAttempts;
+          // 核心：空响应重试逻辑
+          // 条件：
+          // 1. 没有规划重试
+          // 2. 没有推理重试
+          // 3. 有空响应重试指令
+          // 4. 还没达到最大空响应重试次数
           if (
             !nextPlanningOnlyRetryInstruction &&
             !nextReasoningOnlyRetryInstruction &&
@@ -3275,6 +3331,7 @@ export async function runEmbeddedPiAgent(
             );
             continue;
           }
+          // 计算：当前回合是否有【不完整的回复文本】
           const incompleteTurnText = emptyAssistantReplyIsSilent
             ? null
             : resolveIncompleteTurnPayloadText({
@@ -3283,6 +3340,13 @@ export async function runEmbeddedPiAgent(
                 timedOut,
                 attempt,
               });
+          // 一大串判断条件：
+          // 1. 不是静默空回复
+          // 2. 刚刚做过上下文压缩（清理过长对话）
+          // 3. 最终没有返回任何有效内容
+          // 4. 没有被中止、没有报错、没有超时
+          // 5. 没有调用工具、没有副作用
+          // 6. 这种重试只允许 1 次
           if (
             !emptyAssistantReplyIsSilent &&
             attemptCompactionCount > 0 &&
@@ -3306,19 +3370,25 @@ export async function runEmbeddedPiAgent(
             postCompactionGuard.armPostCompaction();
             continue;
           }
-          compactionContinuationRetryInstruction = null;
+          // 清空上下文压缩重试指令（结束该重试分支）
+          compactionContinuationRetryInstruction = null;\
+          // 如果【纯推理重试耗尽】并且【最终没有可见文本】→ 打警告日志
           if (reasoningOnlyRetriesExhausted && !finalAssistantVisibleText) {
             log.warn(
               `reasoning-only retries exhausted: runId=${params.runId} sessionId=${params.sessionId} ` +
                 `provider=${activeErrorContext.provider}/${activeErrorContext.model} attempts=${reasoningOnlyRetryAttempts}/${maxReasoningOnlyRetryAttempts} — surfacing incomplete-turn error`,
             );
           }
+          // 如果：
+          // 1. 没有不完整的半截文本
+          // 2. 还有规划重试指令（说明一直卡在这里）
+          // 3. 当前是【严格智能体模式】
           if (!incompleteTurnText && nextPlanningOnlyRetryInstruction && strictAgenticActive) {
             log.warn(
               `strict-agentic run exhausted planning-only retries: runId=${params.runId} sessionId=${params.sessionId} ` +
                 `provider=${provider}/${modelId} configured=${configuredExecutionContract} — surfacing blocked state`,
             );
-            // Criterion 4 of the GPT-5.4 parity gate requires every terminal
+     // Criterion 4 of the GPT-5.4 parity gate requires every terminal
             // exit path to emit an explicit livenessState + replayInvalid so
             // downstream observers never see "silent disappearance". Every
             // other hard-error terminal branch in this file uses "blocked"
